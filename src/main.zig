@@ -1,10 +1,9 @@
 const std = @import("std");
 
 const DEBUG = false;
+const MAX_ARGS = 100;
 
 pub fn main() !u8 {
-    const max_args = 100;
-
     const stdout = std.io.getStdOut().writer();
     const stderr = std.io.getStdErr().writer();
 
@@ -67,62 +66,10 @@ pub fn main() !u8 {
             };
             try bufWriter.writeByte('\n');
             var cmd = bufStream.getWritten();
-
-            var args_ptrs: [max_args:null]?[*:0]u8 = undefined;
-
-            var inQuotes = false;
-            var openQuote: ?u8 = null;
-            var argStart: usize = 0;
-            var argIndex: u8 = 0;
-            var arg: ?[*:0]u8 = null;
-
-            for (cmd, 0..) |char, i| {
-                if (char == '"' or char == '\'') {
-                    if (inQuotes) {
-                        if (char == openQuote) {
-                            // end quote
-                            cmd[i] = 0;
-                            arg = @as(*align(1) const [*:0]u8, @ptrCast(&cmd[argStart..i :0])).*;
-                            args_ptrs[argIndex] = arg;
-                            argStart = i + 1;
-                            argIndex += 1;
-
-                            inQuotes = false;
-                            openQuote = null;
-                            continue;
-                        } else {
-                            // quote inside quote, continue
-                            continue;
-                        }
-                    } else {
-                        inQuotes = true;
-                        openQuote = char;
-                        argStart = i + 1;
-                        continue;
-                    }
-                }
-
-                if (std.ascii.isWhitespace(char)) {
-                    if (inQuotes) {
-                        continue;
-                    } else {
-                        if (argStart == i) {
-                            // we are at the space after a quoted section, bump arg start and move on
-                            argStart = i + 1;
-                        } else {
-                            cmd[i] = 0;
-                            arg = @as(*align(1) const [*:0]u8, @ptrCast(&cmd[argStart..i :0])).*;
-                            args_ptrs[argIndex] = arg;
-                            argStart = i + 1;
-                            argIndex += 1;
-                        }
-                    }
-                }
-            }
-            args_ptrs[argIndex] = null;
+            var argsPtrs = cmdToArgPtrs(cmd);
 
             if (DEBUG) {
-                for (args_ptrs[0..argIndex]) |argstring| {
+                for (argsPtrs.args[0..argsPtrs.len]) |argstring| {
                     std.debug.print("args: {s}\n", .{argstring.?});
                 }
             }
@@ -130,7 +77,7 @@ pub fn main() !u8 {
             const env = [_:null]?[*:0]u8{null};
 
             // Execute command, replacing child process!
-            var err = std.os.execvpeZ(args_ptrs[0].?, &args_ptrs, &env);
+            var err = std.os.execvpeZ(argsPtrs.args[0].?, &argsPtrs.args, &env);
             try stderr.print("Error: {s}\n", .{@errorName(err)});
             return 1;
         } else {
@@ -139,4 +86,113 @@ pub fn main() !u8 {
     }
 
     return 1;
+}
+
+const ArgPtrsStruct = struct { args: [MAX_ARGS:null]?[*:0]u8, len: usize };
+
+// cmd must end with \n
+fn cmdToArgPtrs(cmd: []u8) ArgPtrsStruct {
+    var args_ptrs: [MAX_ARGS:null]?[*:0]u8 = undefined;
+
+    var inQuotes = false;
+    var openQuote: ?u8 = null;
+    var argStart: usize = 0;
+    var argIndex: u8 = 0;
+    var arg: ?[*:0]u8 = null;
+
+    for (cmd, 0..) |char, i| {
+        if (char == '"' or char == '\'') {
+            if (inQuotes) {
+                if (char == openQuote) {
+                    // end quote
+                    cmd[i] = 0;
+                    arg = @as(*align(1) const [*:0]u8, @ptrCast(&cmd[argStart..i :0])).*;
+                    args_ptrs[argIndex] = arg;
+                    argStart = i + 1;
+                    argIndex += 1;
+
+                    inQuotes = false;
+                    openQuote = null;
+                    continue;
+                } else {
+                    // quote inside quote, continue
+                    continue;
+                }
+            } else {
+                inQuotes = true;
+                openQuote = char;
+                argStart = i + 1;
+                continue;
+            }
+        }
+
+        if (std.ascii.isWhitespace(char)) {
+            if (inQuotes) {
+                continue;
+            } else {
+                if (argStart == i) {
+                    // we are at the space after a quoted section, bump arg start and move on
+                    argStart = i + 1;
+                } else {
+                    cmd[i] = 0;
+                    arg = @as(*align(1) const [*:0]u8, @ptrCast(&cmd[argStart..i :0])).*;
+                    args_ptrs[argIndex] = arg;
+                    argStart = i + 1;
+                    argIndex += 1;
+                }
+            }
+        }
+    }
+    args_ptrs[argIndex] = null;
+
+    return ArgPtrsStruct{
+        .args = args_ptrs,
+        .len = argIndex - 1,
+    };
+}
+
+test cmdToArgPtrs {
+    var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
+
+    const gpa = general_purpose_allocator.allocator();
+
+    var tests = .{
+        .{ "make\n", .{"make"} },
+        .{ "make test\n", .{ "make", "test" } },
+        .{ "ls -la\n", .{ "ls", "-la" } },
+        .{ "/bin/bash\n", .{"/bin/bash"} },
+        .{ "/bin/bash -c 'ls'\n", .{ "/bin/bash", "-c", "ls" } },
+        .{ "/bin/bash -c \"ls\"\n", .{ "/bin/bash", "-c", "ls" } },
+        .{ "/bin/bash -c \"ls -la\"\n", .{ "/bin/bash", "-c", "ls -la" } },
+        .{ "/bin/bash -c \"ls -la | cut -d' '\"\n", .{ "/bin/bash", "-c", "ls -la | cut -d' '" } },
+    };
+
+    inline for (tests) |t| {
+        var tlen = t[0].len;
+        var buffer: [10240]u8 = undefined;
+        var offset: usize = 0;
+        var cmd: []u8 = buffer[offset..tlen];
+        offset += tlen + 1;
+        std.mem.copy(u8, cmd, t[0]);
+
+        var expResult: [t[1].len][]u8 = undefined;
+        inline for (t[1], 0..) |word, i| {
+            var w: []u8 = buffer[offset .. offset + word.len];
+            offset += word.len + 1;
+            std.mem.copy(u8, w, word);
+            expResult[i] = w;
+        }
+        var resultRaw = cmdToArgPtrs(cmd[0..tlen]);
+
+        var result: [t[1].len][]u8 = undefined;
+
+        inline for (resultRaw.args[0..t[1].len], 0..) |word, i| {
+            result[i] = std.mem.span(word.?);
+        }
+
+        var exp: []u8 = try std.mem.join(gpa, "_", &expResult);
+
+        var res: []u8 = try std.mem.join(gpa, "_", &result);
+        try std.testing.expectEqualStrings(exp, res);
+    }
 }
