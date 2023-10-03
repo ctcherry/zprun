@@ -152,9 +152,7 @@ fn cmdToArgPtrs(cmd: []u8) ArgPtrsStruct {
 }
 
 test cmdToArgPtrs {
-    var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
-
-    const gpa = general_purpose_allocator.allocator();
+    const alloc = std.testing.allocator;
 
     var tests = .{
         .{ "make\n", .{"make"} },
@@ -190,9 +188,12 @@ test cmdToArgPtrs {
             result[i] = std.mem.span(word.?);
         }
 
-        var exp: []u8 = try std.mem.join(gpa, "_", &expResult);
+        var exp: []u8 = try std.mem.join(alloc, "_", &expResult);
+        defer alloc.free(exp);
 
-        var res: []u8 = try std.mem.join(gpa, "_", &result);
+        var res: []u8 = try std.mem.join(alloc, "_", &result);
+        defer alloc.free(res);
+
         try std.testing.expectEqualStrings(exp, res);
     }
 }
