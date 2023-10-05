@@ -13,7 +13,7 @@ build-fast:
 test: zig-test integration-test
 
 zig-test:
-	zig test src/main.zig -O ReleaseSafe
+	zig test src/main.zig
 
 integration-test: integration-test-build
 	./tests/run-integration.sh integration-test-build

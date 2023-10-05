@@ -5,9 +5,9 @@ const MAX_ARGS = 100;
 const DEFAULT_PROCFILE_NAME = "Procfile";
 
 const Options = struct {
-    selfName: []u8,
-    procfileName: []u8,
-    targetLabel: []u8,
+    selfName: []const u8,
+    procfileName: []const u8,
+    targetLabel: []const u8,
 };
 
 pub fn main() !u8 {
@@ -26,14 +26,12 @@ pub fn main() !u8 {
         .targetLabel = "",
     };
 
-    getOptions(stderr, args, &opts) catch |err| {
-        switch (err) {
-            error.MissingArg => return 1,
-            else => {
-                try stderr.print("Warning: issue when parsing options: {s}\n", .{@errorName(err)});
-            },
+    if (getOptions(args, &opts)) |optsErrors| {
+        for (optsErrors.details) |err| {
+            try stderr.print("{s}\n", .{err});
         }
-    };
+        return 1;
+    }
 
     var procfile = std.fs.cwd().openFile(opts.procfileName, .{}) catch |err| {
         switch (err) {
@@ -78,7 +76,11 @@ pub fn main() !u8 {
     unreachable;
 }
 
-fn getOptions(stderr: std.fs.File.Writer, args: anytype, opts: *Options) !void {
+const OptionErrors = struct {
+    details: []const []const u8,
+};
+
+fn getOptions(args: anytype, opts: *Options) ?OptionErrors {
     var argi: usize = 1;
     while (argi < args.len) : (argi += 1) {
         var arg = args[argi];
@@ -88,12 +90,12 @@ fn getOptions(stderr: std.fs.File.Writer, args: anytype, opts: *Options) !void {
                 argi += 1;
                 continue;
             } else {
-                try stderr.print("Error: Missing argument for -f\n", .{});
-                return error.MissingArg;
+                return OptionErrors{ .details = &[_][]const u8{"Missing argument for -f"} };
             }
         }
         opts.targetLabel = arg;
     }
+    return null;
 }
 
 fn execCmd(cmd: []u8) !void {
@@ -112,7 +114,7 @@ fn execCmd(cmd: []u8) !void {
 }
 
 // caller is responsible for freeing returned []u8
-fn getCmdFromProcfile(alloc: std.mem.Allocator, reader: anytype, targetLabel: []u8) ![]u8 {
+fn getCmdFromProcfile(alloc: std.mem.Allocator, reader: anytype, targetLabel: []const u8) ![]u8 {
     var buf = try alloc.alloc(u8, 1024);
     defer alloc.free(buf);
 
@@ -243,6 +245,58 @@ fn cmdToArgPtrs(cmd: []u8) ArgPtrsStruct {
         .args = args_ptrs,
         .len = argIndex - 1,
     };
+}
+
+test "getOptions" {
+    const alloc = std.testing.allocator;
+
+    var base_opts = Options{
+        .selfName = "initial value",
+        .procfileName = "initial value",
+        .targetLabel = "initial value",
+    };
+
+    var tests = .{
+        .{ "normal options", "cmd -f Procfiletest label0", "", "Procfiletest", "label0" },
+        .{ "reverse options", "cmd label0 -f Procfiletest", "", "Procfiletest", "label0" },
+        .{ "missing -f arg", "cmd label1 -f", "Missing argument for -f", "initial value", "label1" },
+        .{ "missing label", "cmd -f Procfiletest", "", "Procfiletest", "initial value" },
+        .{ "no params", "cmd", "Missing argument for -f", "initial value", "initial value" },
+    };
+
+    std.debug.print("\n", .{});
+    inline for (tests, 0..) |t, i| {
+        std.debug.print("Test {d} {s}: start...", .{ i, t[0] });
+        var opts = base_opts;
+        var cmdString = t[1];
+
+        var argBuffer = try std.ArrayList([]const u8).initCapacity(alloc, 5);
+
+        var argSeq = std.mem.splitSequence(u8, cmdString, " ");
+        var reading = true;
+        while (reading) {
+            var item = argSeq.next();
+            if (item) |ai| {
+                try argBuffer.append(ai);
+            } else {
+                reading = false;
+            }
+        }
+        var args = try argBuffer.toOwnedSlice();
+
+        var expected_procfilename: []const u8 = t[3];
+        var expected_label: []const u8 = t[4];
+
+        if (getOptions(args, &opts)) |optsErrs| {
+            try std.testing.expectEqualStrings(t[2], optsErrs.details[0]);
+        }
+
+        // std.debug.print("XXXXXXX {any} '{s}' {any} '{s}'\n", .{ @TypeOf(expected_procfilename), expected_procfilename, @TypeOf(opts.procfileName), opts.procfileName });
+        try std.testing.expectEqualStrings(expected_procfilename, opts.procfileName);
+        try std.testing.expectEqualStrings(expected_label, opts.targetLabel);
+        std.debug.print("done\n", .{});
+        alloc.free(args);
+    }
 }
 
 test "getCmdFromProcfile errors" {
