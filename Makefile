@@ -1,14 +1,17 @@
 build:
-	zig build-exe src/main.zig -O ReleaseSafe --name zigrun
+	zig build-exe src/main.zig -O ReleaseSafe --name zprun
 
 build-debug:
-	zig build-exe src/main.zig --name zigrun
+	zig build-exe src/main.zig --name zprun
 	
 build-small:
-	zig build-exe src/main.zig -O ReleaseSmall --name zigrun
+	zig build-exe src/main.zig -O ReleaseSmall --name zprun
 
 build-fast:
-	zig build-exe src/main.zig -O ReleaseFast --name zigrun
+	zig build-exe src/main.zig -O ReleaseFast --name zprun
+
+build-linux-static:
+	zig build-exe src/main.zig -target x86_64-linux-musl --name zprun -O ReleaseSafe
 
 test: zig-test integration-test
 

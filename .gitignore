@@ -1,5 +1,5 @@
-zigrun
-zigrun.o
+zprun
+zprun.o
 integration-test-build
 integration-test-build.o
 zig-cache/
