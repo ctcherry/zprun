@@ -2,43 +2,132 @@ const std = @import("std");
 
 const DEBUG = false;
 const MAX_ARGS = 100;
+const DEFAULT_PROCFILE_NAME = "Procfile";
+
+const Options = struct {
+    selfName: []u8,
+    procfileName: []u8,
+    targetLabel: []u8,
+};
 
 pub fn main() !u8 {
-    const stdout = std.io.getStdOut().writer();
     const stderr = std.io.getStdErr().writer();
 
-    if (std.os.argv.len < 2) {
-        try stdout.print("Usage: {s} <label>\n", .{std.os.argv[0]});
+    var allocSpace: [4096 * 32]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocSpace);
+    var alloc = fba.allocator();
+
+    var args = try std.process.argsAlloc(alloc);
+    defer std.process.argsFree(alloc, args);
+
+    var opts = Options{
+        .selfName = args[0],
+        .procfileName = try alloc.dupe(u8, DEFAULT_PROCFILE_NAME),
+        .targetLabel = "",
+    };
+
+    getOptions(stderr, args, &opts) catch |err| {
+        switch (err) {
+            error.MissingArg => return 1,
+            else => {
+                try stderr.print("Warning: issue when parsing options: {s}\n", .{@errorName(err)});
+            },
+        }
+    };
+
+    var procfile = std.fs.cwd().openFile(opts.procfileName, .{}) catch |err| {
+        switch (err) {
+            error.FileNotFound => {
+                try stderr.print("Error: File '{s}' for procfile not found\n", .{opts.procfileName});
+            },
+            else => {
+                try stderr.print("Error opening file '{s}' {s}\n", .{ opts.procfileName, @errorName(err) });
+            },
+        }
+        return 1;
+    };
+    defer procfile.close();
+
+    if (opts.targetLabel.len == 0) {
+        try stderr.print("Usage: {s} [options] <label>\n\tlabel    Label of the command to run in Procfile\n\t-f path  Use file other than Procfile", .{opts.selfName});
         return 1;
     }
 
-    // std.debug.print("{any}\n", .{std.os.argv});
-    // std.debug.print("{any}\n", .{@TypeOf(std.os.argv[1])});
+    var procfileBufReader_ = std.io.bufferedReader(procfile.reader());
+    var procfileBufReader = procfileBufReader_.reader();
 
-    var targetLabel = std.mem.span(std.os.argv[1]);
+    var command = getCmdFromProcfile(alloc, procfileBufReader, opts.targetLabel) catch |err| {
+        switch (err) {
+            error.LabelNotFound => {
+                try stderr.print("Error: Unable to find label '{s}' in procfile '{s}'\n", .{ opts.targetLabel, opts.procfileName });
+            },
+            error.EmptyCmd => {
+                try stderr.print("Error: Unable to find command for label '{s}' in procfile '{s}'\n", .{ opts.targetLabel, opts.procfileName });
+            },
+            else => {
+                try stderr.print("Error: Extracting command from procfile '{s}'\n", .{@errorName(err)});
+            },
+        }
+        return 1;
+    };
 
-    var file = try std.fs.cwd().openFile("Procfile", .{});
-    defer file.close();
+    execCmd(command) catch |err| {
+        try stderr.print("Error executing command: '{s}' from label '{s}' in procfile '{s}': {s}\n", .{ command, opts.targetLabel, opts.procfileName, @errorName(err) });
+        return 1;
+    };
+    unreachable;
+}
 
-    var buf_reader = std.io.bufferedReader(file.reader());
-    var in_stream = buf_reader.reader();
+fn getOptions(stderr: std.fs.File.Writer, args: anytype, opts: *Options) !void {
+    var argi: usize = 1;
+    while (argi < args.len) : (argi += 1) {
+        var arg = args[argi];
+        if (std.mem.eql(u8, arg, "-f")) {
+            if (args.len - 1 >= argi + 1) {
+                opts.procfileName = args[argi + 1];
+                argi += 1;
+                continue;
+            } else {
+                try stderr.print("Error: Missing argument for -f\n", .{});
+                return error.MissingArg;
+            }
+        }
+        opts.targetLabel = arg;
+    }
+}
 
-    var buf: [1024]u8 = undefined;
-    var bufStream = std.io.fixedBufferStream(&buf);
+fn execCmd(cmd: []u8) !void {
+    var argsPtrs = cmdToArgPtrs(cmd);
+
+    if (DEBUG) {
+        for (argsPtrs.args[0..argsPtrs.len]) |argstring| {
+            std.debug.print("args: {s}\n", .{argstring.?});
+        }
+    }
+
+    const env = [_:null]?[*:0]u8{null};
+
+    // Execute command, replacing this process!
+    return std.os.execvpeZ(argsPtrs.args[0].?, &argsPtrs.args, &env);
+}
+
+// caller is responsible for freeing returned []u8
+fn getCmdFromProcfile(alloc: std.mem.Allocator, reader: anytype, targetLabel: []u8) ![]u8 {
+    var buf = try alloc.alloc(u8, 1024);
+    defer alloc.free(buf);
+
+    var bufStream = std.io.fixedBufferStream(buf);
 
     var reading = true;
 
     while (reading) {
         bufStream.reset();
-        in_stream.streamUntilDelimiter(bufStream.writer(), ':', null) catch |err| switch (err) {
+        reader.streamUntilDelimiter(bufStream.writer(), ':', null) catch |err| switch (err) {
             error.EndOfStream => {
-                reading = false;
-                try stderr.print("Error: Could not find label '{s}'\n", .{targetLabel});
-                return 1;
+                return error.LabelNotFound;
             },
             else => {
-                try stderr.print("Error: {s}\n", .{@errorName(err)});
-                return 1;
+                return err;
             },
         };
 
@@ -48,44 +137,49 @@ pub fn main() !u8 {
         if (std.mem.eql(u8, label, targetLabel)) {
             // label match found
             bufStream.reset();
+            var bufWriter = bufStream.writer();
             // Skip whitespace
             while (true) {
-                var b = try in_stream.readByte();
+                var b = reader.readByte() catch |err| {
+                    // HACK: We arent using a switch here becuase `zig test src/main.zig` would say:
+                    // src/main.zig:147:26: error: unreachable else prong; all cases already handled
+                    // If I then removed the else, then zig build-exe src/main.zig would say:
+                    // src/main.zig:143:55: error: switch must handle all possibilities
+                    if (err == error.EndOfStream) {
+                        return error.EmptyCmd;
+                    } else {
+                        return err;
+                    }
+                };
+                if (b == '\n') {
+                    return error.EmptyCmd;
+                }
                 if (!std.ascii.isWhitespace(b)) {
-                    try bufStream.writer().writeByte(b);
+                    try bufWriter.writeByte(b);
                     break;
                 }
             }
 
-            var bufWriter = bufStream.writer();
             // Read the rest until end of line
-            in_stream.streamUntilDelimiter(bufWriter, '\n', null) catch |err| {
-                try stderr.print("Error: {s}\n", .{@errorName(err)});
-                reading = false;
-                return 1;
+            reader.streamUntilDelimiter(bufWriter, '\n', null) catch |err| switch (err) {
+                error.EndOfStream => {
+                    // this is ok, continue on
+                },
+                else => {
+                    return err;
+                },
             };
             try bufWriter.writeByte('\n');
-            var cmd = bufStream.getWritten();
-            var argsPtrs = cmdToArgPtrs(cmd);
+            var procCmd = bufStream.getWritten();
 
-            if (DEBUG) {
-                for (argsPtrs.args[0..argsPtrs.len]) |argstring| {
-                    std.debug.print("args: {s}\n", .{argstring.?});
-                }
-            }
-
-            const env = [_:null]?[*:0]u8{null};
-
-            // Execute command, replacing child process!
-            var err = std.os.execvpeZ(argsPtrs.args[0].?, &argsPtrs.args, &env);
-            try stderr.print("Error: {s}\n", .{@errorName(err)});
-            return 1;
+            var cmd = try alloc.dupe(u8, procCmd);
+            return cmd;
         } else {
-            try in_stream.skipUntilDelimiterOrEof('\n');
+            try reader.skipUntilDelimiterOrEof('\n');
         }
     }
 
-    return 1;
+    return error.LabelNotFound;
 }
 
 const ArgPtrsStruct = struct { args: [MAX_ARGS:null]?[*:0]u8, len: usize };
@@ -151,7 +245,66 @@ fn cmdToArgPtrs(cmd: []u8) ArgPtrsStruct {
     };
 }
 
-test cmdToArgPtrs {
+test "getCmdFromProcfile errors" {
+    const alloc = std.testing.allocator;
+
+    var tests = .{
+        .{ "cmd is empty, end of file", "label3", "label1: ls -la\nlabel2: less\nlabel3:", error.EmptyCmd },
+        .{ "cmd is empty, middle file", "label2", "label1: ls -la\nlabel2:\nlabel3: grep\n", error.EmptyCmd },
+        .{ "empty procfile", "label1", "", error.LabelNotFound },
+    };
+
+    std.debug.print("\n", .{});
+    inline for (tests, 0..) |t, i| {
+        std.debug.print("Test {d} {s}: start...", .{ i, t[0] });
+
+        var targetLabel = try alloc.dupe(u8, t[1]);
+        defer alloc.free(targetLabel);
+
+        var procfile = t[2];
+        var expectedError = t[3];
+        var fbs = std.io.fixedBufferStream(procfile);
+        var r = fbs.reader();
+
+        var result = getCmdFromProcfile(alloc, r, targetLabel);
+        try std.testing.expectError(expectedError, result);
+        std.debug.print("done\n", .{});
+    }
+}
+
+test "getCmdFromProcfile simple" {
+    const alloc = std.testing.allocator;
+
+    var tests = .{
+        .{ "one profile entry", "label1", "label1: ls -la\n", "ls -la\n" },
+        .{ "match in middle of file", "label2", "label1: ls -la\nlabel2: less\nlabel3: grep\n", "less\n" },
+        .{ "match on last line", "label3", "label1: ls -la\nlabel2: less\nlabel3: grep\n", "grep\n" },
+        .{ "no ending newline", "label3", "label1: ls -la\nlabel2: less\nlabel3: grep", "grep\n" },
+        .{ "label with dash", "label-3", "label1: ls -la\nlabel2: less\nlabel-3: grep\n", "grep\n" },
+        .{ "label with space", "label 2", "label1: ls -la\nlabel 2: less\nlabel3: grep\n", "less\n" },
+        .{ "label with symbol", "label*2", "label1: ls -la\nlabel*2: less\nlabel3: grep\n", "less\n" },
+    };
+
+    std.debug.print("\n", .{});
+    inline for (tests, 0..) |t, i| {
+        std.debug.print("Test {d} {s}: start...", .{ i, t[0] });
+
+        var targetLabel = try alloc.dupe(u8, t[1]);
+        defer alloc.free(targetLabel);
+
+        var procfile = t[2];
+        var expectedResult = t[3];
+        var fbs = std.io.fixedBufferStream(procfile);
+        var r = fbs.reader();
+
+        var result = try getCmdFromProcfile(alloc, r, targetLabel);
+        try std.testing.expectEqualStrings(expectedResult, result);
+        alloc.free(result);
+        std.debug.print("done\n", .{});
+    }
+}
+
+test "cmdToArgPtrs table of tests" {
     const alloc = std.testing.allocator;
 
     var tests = .{

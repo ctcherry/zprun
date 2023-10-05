@@ -1,5 +1,7 @@
 zigrun
 zigrun.o
+integration-test-build
+integration-test-build.o
 zig-cache/
 zig-out/
 /release/
