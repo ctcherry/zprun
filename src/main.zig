@@ -13,7 +13,7 @@ const Options = struct {
 pub fn main() !u8 {
     const stderr = std.io.getStdErr().writer();
 
-    var allocSpace: [4096 * 32]u8 = undefined;
+    var allocSpace: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&allocSpace);
     var alloc = fba.allocator();
 
