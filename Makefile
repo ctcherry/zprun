@@ -13,6 +13,9 @@ build-fast:
 build-linux-static:
 	zig build-exe src/main.zig -target x86_64-linux-musl --name zprun -O ReleaseSafe
 
+clean:
+	rm -f integration-test-build* zprun*
+
 test: zig-test integration-test
 
 zig-test:

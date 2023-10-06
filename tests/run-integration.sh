@@ -31,5 +31,12 @@ else
   echo "failed"
 fi
 
+echo -n "Test error when unknown param -z: "
+if $bin "label0" -z 2>&1 | grep -q "Unknown argument '-z'"; then
+  echo "passed"
+else
+  echo "failed"
+fi
+
 rm -rf $tmpdir
 exit 0

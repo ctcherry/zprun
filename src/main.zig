@@ -26,12 +26,15 @@ pub fn main() !u8 {
         .targetLabel = "",
     };
 
-    if (getOptions(args, &opts)) |optsErrors| {
-        for (optsErrors.details) |err| {
+    var optsErrs = try OptionErrors.initCapacity(alloc, 2);
+    defer optsErrs.deinit();
+    getOptions(alloc, args, &opts, &optsErrs) catch {
+        for (optsErrs.items) |err| {
+            defer alloc.free(optsErrs.items[0]);
             try stderr.print("{s}\n", .{err});
         }
         return 1;
-    }
+    };
 
     var procfile = std.fs.cwd().openFile(opts.procfileName, .{}) catch |err| {
         switch (err) {
@@ -76,26 +79,44 @@ pub fn main() !u8 {
     unreachable;
 }
 
-const OptionErrors = struct {
-    details: []const []const u8,
-};
+const OptionErrors = std.ArrayList([]const u8);
 
-fn getOptions(args: anytype, opts: *Options) ?OptionErrors {
+fn getOptions(alloc: std.mem.Allocator, args: anytype, opts: *Options, optsErrors: *OptionErrors) !void {
     var argi: usize = 1;
     while (argi < args.len) : (argi += 1) {
         var arg = args[argi];
-        if (std.mem.eql(u8, arg, "-f")) {
-            if (args.len - 1 >= argi + 1) {
-                opts.procfileName = args[argi + 1];
-                argi += 1;
-                continue;
+        if (arg[0] == '-') {
+            if (std.mem.eql(u8, arg, "-f")) {
+                if (args.len - 1 >= argi + 1) {
+                    opts.procfileName = args[argi + 1];
+                    argi += 1;
+                    continue;
+                } else {
+                    const message = try std.fmt.allocPrint(
+                        alloc,
+                        "Missing argument for {s}",
+                        .{"-f"},
+                    );
+
+                    try optsErrors.append(message);
+                }
             } else {
-                return OptionErrors{ .details = &[_][]const u8{"Missing argument for -f"} };
+                const message = try std.fmt.allocPrint(
+                    alloc,
+                    "Unknown argument '{s}'",
+                    .{arg},
+                );
+
+                try optsErrors.append(message);
             }
+        } else {
+            opts.targetLabel = arg;
         }
-        opts.targetLabel = arg;
     }
-    return null;
+    if (optsErrors.items.len > 0) {
+        return error.OptionErrors;
+    }
+    return void{};
 }
 
 fn execCmd(cmd: []u8) !void {
@@ -262,6 +283,9 @@ test "getOptions" {
         .{ "missing -f arg", "cmd label1 -f", "Missing argument for -f", "initial value", "label1" },
         .{ "missing label", "cmd -f Procfiletest", "", "Procfiletest", "initial value" },
         .{ "no params", "cmd", "Missing argument for -f", "initial value", "initial value" },
+        .{ "wrong param", "cmd -f Procfiletest -a", "Unknown argument '-a'", "Procfiletest", "initial value" },
+        .{ "wrong param 2", "cmd -a -f Procfiletest", "Unknown argument '-a'", "Procfiletest", "initial value" },
+        .{ "wrong param 3", "cmd -a", "Unknown argument '-a'", "initial value", "initial value" },
     };
 
     std.debug.print("\n", .{});
@@ -287,9 +311,12 @@ test "getOptions" {
         var expected_procfilename: []const u8 = t[3];
         var expected_label: []const u8 = t[4];
 
-        if (getOptions(args, &opts)) |optsErrs| {
-            try std.testing.expectEqualStrings(t[2], optsErrs.details[0]);
-        }
+        var optsErrs = try OptionErrors.initCapacity(alloc, 2);
+        defer optsErrs.deinit();
+        getOptions(alloc, args, &opts, &optsErrs) catch {
+            defer alloc.free(optsErrs.items[0]);
+            try std.testing.expectEqualStrings(t[2], optsErrs.items[0]);
+        };
 
         // std.debug.print("XXXXXXX {any} '{s}' {any} '{s}'\n", .{ @TypeOf(expected_procfilename), expected_procfilename, @TypeOf(opts.procfileName), opts.procfileName });
         try std.testing.expectEqualStrings(expected_procfilename, opts.procfileName);
