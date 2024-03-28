@@ -17,7 +17,7 @@ pub fn main() !u8 {
     var fba = std.heap.FixedBufferAllocator.init(&allocSpace);
     var alloc = fba.allocator();
 
-    var args = try std.process.argsAlloc(alloc);
+    const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
 
     var opts = Options{
@@ -55,9 +55,9 @@ pub fn main() !u8 {
     }
 
     var procfileBufReader_ = std.io.bufferedReader(procfile.reader());
-    var procfileBufReader = procfileBufReader_.reader();
+    const procfileBufReader = procfileBufReader_.reader();
 
-    var command = getCmdFromProcfile(alloc, procfileBufReader, opts.targetLabel) catch |err| {
+    const command = getCmdFromProcfile(alloc, procfileBufReader, opts.targetLabel) catch |err| {
         switch (err) {
             error.LabelNotFound => {
                 try stderr.print("Error: Unable to find label '{s}' in procfile '{s}'\n", .{ opts.targetLabel, opts.procfileName });
@@ -84,7 +84,7 @@ const OptionErrors = std.ArrayList([]const u8);
 fn getOptions(alloc: std.mem.Allocator, args: anytype, opts: *Options, optsErrors: *OptionErrors) !void {
     var argi: usize = 1;
     while (argi < args.len) : (argi += 1) {
-        var arg = args[argi];
+        const arg = args[argi];
         if (arg[0] == '-') {
             if (std.mem.eql(u8, arg, "-f")) {
                 if (args.len - 1 >= argi + 1) {
@@ -131,17 +131,17 @@ fn execCmd(cmd: []u8) !void {
     const env = [_:null]?[*:0]u8{null};
 
     // Execute command, replacing this process!
-    return std.os.execvpeZ(argsPtrs.args[0].?, &argsPtrs.args, &env);
+    return std.posix.execvpeZ(argsPtrs.args[0].?, &argsPtrs.args, &env);
 }
 
 // caller is responsible for freeing returned []u8
 fn getCmdFromProcfile(alloc: std.mem.Allocator, reader: anytype, targetLabel: []const u8) ![]u8 {
-    var buf = try alloc.alloc(u8, 1024);
+    const buf = try alloc.alloc(u8, 1024);
     defer alloc.free(buf);
 
     var bufStream = std.io.fixedBufferStream(buf);
 
-    var reading = true;
+    const reading = true;
 
     while (reading) {
         bufStream.reset();
@@ -154,8 +154,8 @@ fn getCmdFromProcfile(alloc: std.mem.Allocator, reader: anytype, targetLabel: []
             },
         };
 
-        var labelRaw = bufStream.getWritten();
-        var label = std.mem.trim(u8, labelRaw, &std.ascii.whitespace);
+        const labelRaw = bufStream.getWritten();
+        const label = std.mem.trim(u8, labelRaw, &std.ascii.whitespace);
 
         if (std.mem.eql(u8, label, targetLabel)) {
             // label match found
@@ -163,7 +163,7 @@ fn getCmdFromProcfile(alloc: std.mem.Allocator, reader: anytype, targetLabel: []
             var bufWriter = bufStream.writer();
             // Skip whitespace
             while (true) {
-                var b = reader.readByte() catch |err| {
+                const b = reader.readByte() catch |err| {
                     // HACK: We arent using a switch here becuase `zig test src/main.zig` would say:
                     // src/main.zig:147:26: error: unreachable else prong; all cases already handled
                     // If I then removed the else, then zig build-exe src/main.zig would say:
@@ -193,9 +193,9 @@ fn getCmdFromProcfile(alloc: std.mem.Allocator, reader: anytype, targetLabel: []
                 },
             };
             try bufWriter.writeByte('\n');
-            var procCmd = bufStream.getWritten();
+            const procCmd = bufStream.getWritten();
 
-            var cmd = try alloc.dupe(u8, procCmd);
+            const cmd = try alloc.dupe(u8, procCmd);
             return cmd;
         } else {
             try reader.skipUntilDelimiterOrEof('\n');
@@ -271,13 +271,13 @@ fn cmdToArgPtrs(cmd: []u8) ArgPtrsStruct {
 test "getOptions" {
     const alloc = std.testing.allocator;
 
-    var base_opts = Options{
+    const base_opts = Options{
         .selfName = "initial value",
         .procfileName = "initial value",
         .targetLabel = "initial value",
     };
 
-    var tests = .{
+    const tests = .{
         .{ "normal options", "cmd -f Procfiletest label0", "", "Procfiletest", "label0" },
         .{ "reverse options", "cmd label0 -f Procfiletest", "", "Procfiletest", "label0" },
         .{ "missing -f arg", "cmd label1 -f", "Missing argument for -f", "initial value", "label1" },
@@ -292,24 +292,24 @@ test "getOptions" {
     inline for (tests, 0..) |t, i| {
         std.debug.print("Test {d} {s}: start...", .{ i, t[0] });
         var opts = base_opts;
-        var cmdString = t[1];
+        const cmdString = t[1];
 
         var argBuffer = try std.ArrayList([]const u8).initCapacity(alloc, 5);
 
         var argSeq = std.mem.splitSequence(u8, cmdString, " ");
         var reading = true;
         while (reading) {
-            var item = argSeq.next();
+            const item = argSeq.next();
             if (item) |ai| {
                 try argBuffer.append(ai);
             } else {
                 reading = false;
             }
         }
-        var args = try argBuffer.toOwnedSlice();
+        const args = try argBuffer.toOwnedSlice();
 
-        var expected_procfilename: []const u8 = t[3];
-        var expected_label: []const u8 = t[4];
+        const expected_procfilename: []const u8 = t[3];
+        const expected_label: []const u8 = t[4];
 
         var optsErrs = try OptionErrors.initCapacity(alloc, 2);
         defer optsErrs.deinit();
@@ -329,7 +329,7 @@ test "getOptions" {
 test "getCmdFromProcfile errors" {
     const alloc = std.testing.allocator;
 
-    var tests = .{
+    const tests = .{
         .{ "cmd is empty, end of file", "label3", "label1: ls -la\nlabel2: less\nlabel3:", error.EmptyCmd },
         .{ "cmd is empty, middle file", "label2", "label1: ls -la\nlabel2:\nlabel3: grep\n", error.EmptyCmd },
         .{ "empty procfile", "label1", "", error.LabelNotFound },
@@ -339,15 +339,15 @@ test "getCmdFromProcfile errors" {
     inline for (tests, 0..) |t, i| {
         std.debug.print("Test {d} {s}: start...", .{ i, t[0] });
 
-        var targetLabel = try alloc.dupe(u8, t[1]);
+        const targetLabel = try alloc.dupe(u8, t[1]);
         defer alloc.free(targetLabel);
 
-        var procfile = t[2];
-        var expectedError = t[3];
+        const procfile = t[2];
+        const expectedError = t[3];
         var fbs = std.io.fixedBufferStream(procfile);
-        var r = fbs.reader();
+        const r = fbs.reader();
 
-        var result = getCmdFromProcfile(alloc, r, targetLabel);
+        const result = getCmdFromProcfile(alloc, r, targetLabel);
         try std.testing.expectError(expectedError, result);
         std.debug.print("done\n", .{});
     }
@@ -356,7 +356,7 @@ test "getCmdFromProcfile errors" {
 test "getCmdFromProcfile simple" {
     const alloc = std.testing.allocator;
 
-    var tests = .{
+    const tests = .{
         .{ "one profile entry", "label1", "label1: ls -la\n", "ls -la\n" },
         .{ "match in middle of file", "label2", "label1: ls -la\nlabel2: less\nlabel3: grep\n", "less\n" },
         .{ "match on last line", "label3", "label1: ls -la\nlabel2: less\nlabel3: grep\n", "grep\n" },
@@ -370,15 +370,15 @@ test "getCmdFromProcfile simple" {
     inline for (tests, 0..) |t, i| {
         std.debug.print("Test {d} {s}: start...", .{ i, t[0] });
 
-        var targetLabel = try alloc.dupe(u8, t[1]);
+        const targetLabel = try alloc.dupe(u8, t[1]);
         defer alloc.free(targetLabel);
 
-        var procfile = t[2];
-        var expectedResult = t[3];
+        const procfile = t[2];
+        const expectedResult = t[3];
         var fbs = std.io.fixedBufferStream(procfile);
-        var r = fbs.reader();
+        const r = fbs.reader();
 
-        var result = try getCmdFromProcfile(alloc, r, targetLabel);
+        const result = try getCmdFromProcfile(alloc, r, targetLabel);
         try std.testing.expectEqualStrings(expectedResult, result);
         alloc.free(result);
         std.debug.print("done\n", .{});
@@ -388,7 +388,7 @@ test "getCmdFromProcfile simple" {
 test "cmdToArgPtrs table of tests" {
     const alloc = std.testing.allocator;
 
-    var tests = .{
+    const tests = .{
         .{ "make\n", .{"make"} },
         .{ "make test\n", .{ "make", "test" } },
         .{ "ls -la\n", .{ "ls", "-la" } },
@@ -400,7 +400,7 @@ test "cmdToArgPtrs table of tests" {
     };
 
     inline for (tests) |t| {
-        var tlen = t[0].len;
+        const tlen = t[0].len;
         var buffer: [10240]u8 = undefined;
         var offset: usize = 0;
         var cmd: []u8 = buffer[offset..tlen];
@@ -409,7 +409,7 @@ test "cmdToArgPtrs table of tests" {
 
         var expResult: [t[1].len][]u8 = undefined;
         inline for (t[1], 0..) |word, i| {
-            var w: []u8 = buffer[offset .. offset + word.len];
+            const w: []u8 = buffer[offset .. offset + word.len];
             offset += word.len + 1;
             std.mem.copy(u8, w, word);
             expResult[i] = w;
@@ -422,10 +422,10 @@ test "cmdToArgPtrs table of tests" {
             result[i] = std.mem.span(word.?);
         }
 
-        var exp: []u8 = try std.mem.join(alloc, "_", &expResult);
+        const exp: []u8 = try std.mem.join(alloc, "_", &expResult);
         defer alloc.free(exp);
 
-        var res: []u8 = try std.mem.join(alloc, "_", &result);
+        const res: []u8 = try std.mem.join(alloc, "_", &result);
         defer alloc.free(res);
 
         try std.testing.expectEqualStrings(exp, res);
