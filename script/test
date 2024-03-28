@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+
+#cd to 1 directory above the script directory
+cd "$(dirname "$0")/.."
+
+function zig_test() {
+  zig test src/main.zig
+}
+
+function integration_test() {
+  ./script/build integration-test
+	./tests/run-integration.sh integration-test-build
+}
+
+# if no arguments are passed, build the project
+if [ -z "$1" ]; then
+  zig_test
+  integration_test
+  exit 0
+fi
+
+if [ "$1" == "zig-test" ]; then
+  zig_test
+  exit 0
+fi
+
+if [ "$1" == "integration-test" ]; then
+  integration_test
+  exit 0
+fi
+

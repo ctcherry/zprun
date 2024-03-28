@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+
+#cd to 1 directory above the script directory
+cd "$(dirname "$0")/.."
+
+# if no arguments are passed, build the project
+if [ -z "$1" ]; then
+	zig build-exe src/main.zig -O ReleaseSafe --name zprun
+  exit 0
+fi
+
+if [ "$1" == "debug" ]; then
+	zig build-exe src/main.zig --name zprun
+  exit 0
+fi
+
+if [ "$1" == "small" ]; then
+	zig build-exe src/main.zig -O ReleaseSmall --name zprun
+  exit 0
+fi
+
+if [ "$1" == "fast" ]; then
+  zig build-exe src/main.zig -O ReleaseFast --name zprun
+  exit 0
+fi
+
+if [ "$1" == "linux-static" ]; then
+	zig build-exe src/main.zig -target x86_64-linux-musl --name zprun -O ReleaseSafe
+  exit 0
+fi
+
+if [ "$1" == "integration-test" ]; then
+	zig build-exe src/main.zig -O ReleaseSafe --name integration-test-build
+  exit 0
+fi
