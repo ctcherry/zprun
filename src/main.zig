@@ -7,13 +7,13 @@ const DEFAULT_PROCFILE_NAME = "Procfile";
 const Options = struct {
     selfName: []const u8,
     procfileName: []const u8,
-    targetLabel: []const u8,
+    targetLabels: std.ArrayList([]const u8),
 };
 
 pub fn main() !u8 {
     const stderr = std.io.getStdErr().writer();
 
-    var allocSpace: [4096]u8 = undefined;
+    var allocSpace: [1024 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&allocSpace);
     var alloc = fba.allocator();
 
@@ -23,7 +23,7 @@ pub fn main() !u8 {
     var opts = Options{
         .selfName = args[0],
         .procfileName = try alloc.dupe(u8, DEFAULT_PROCFILE_NAME),
-        .targetLabel = "",
+        .targetLabels = std.ArrayList([]const u8).init(alloc),
     };
 
     var optsErrs = try OptionErrors.initCapacity(alloc, 2);
@@ -49,7 +49,7 @@ pub fn main() !u8 {
     };
     defer procfile.close();
 
-    if (opts.targetLabel.len == 0) {
+    if (opts.targetLabels.items.len == 0) {
         try stderr.print("Usage: {s} [options] <label>\n\tlabel    Label of the command to run in Procfile\n\t-f path  Use file other than Procfile", .{opts.selfName});
         return 1;
     }
@@ -57,13 +57,13 @@ pub fn main() !u8 {
     var procfileBufReader_ = std.io.bufferedReader(procfile.reader());
     const procfileBufReader = procfileBufReader_.reader();
 
-    const command = getCmdFromProcfile(alloc, procfileBufReader, opts.targetLabel) catch |err| {
+    const commands = getCmdsFromProcfile(alloc, procfileBufReader, opts.targetLabels.items) catch |err| {
         switch (err) {
             error.LabelNotFound => {
-                try stderr.print("Error: Unable to find label '{s}' in procfile '{s}'\n", .{ opts.targetLabel, opts.procfileName });
+                try stderr.print("Error: Unable to find all labels in procfile '{s}'\n", .{opts.procfileName});
             },
             error.EmptyCmd => {
-                try stderr.print("Error: Unable to find command for label '{s}' in procfile '{s}'\n", .{ opts.targetLabel, opts.procfileName });
+                try stderr.print("Error: Unable to find command for all labels in procfile '{s}'\n", .{opts.procfileName});
             },
             else => {
                 try stderr.print("Error: Extracting command from procfile '{s}'\n", .{@errorName(err)});
@@ -72,11 +72,200 @@ pub fn main() !u8 {
         return 1;
     };
 
-    execCmd(command) catch |err| {
-        try stderr.print("Error executing command: '{s}' from label '{s}' in procfile '{s}': {s}\n", .{ command, opts.targetLabel, opts.procfileName, @errorName(err) });
+    var out_pipe_fds = std.ArrayList(std.posix.fd_t).initCapacity(alloc, commands.items.len) catch |err| {
+        try stderr.print("Error initializing stdout pipes list '{s}'\n", .{@errorName(err)});
         return 1;
     };
-    unreachable;
+
+    var err_pipe_fds = std.ArrayList(std.posix.fd_t).initCapacity(alloc, commands.items.len) catch |err| {
+        try stderr.print("Error initializing stderr pipes list '{s}'\n", .{@errorName(err)});
+        return 1;
+    };
+
+    var children = std.ArrayList(std.ChildProcess).initCapacity(alloc, commands.items.len) catch |err| {
+        try stderr.print("Error initializing children list '{s}'\n", .{@errorName(err)});
+        return 1;
+    };
+
+    for (commands.items) |command| {
+        var cmd_args = try cmdToArgs(alloc, command);
+        const cmd_args_owned = try cmd_args.toOwnedSlice();
+        var child_proc = std.ChildProcess.init(cmd_args_owned, alloc);
+        child_proc.stdout_behavior = .Pipe;
+        child_proc.stderr_behavior = .Pipe;
+        child_proc.stdin_behavior = .Ignore;
+
+        child_proc.spawn() catch |err| {
+            try stderr.print("Error spawning child process '{s}'\n", .{@errorName(err)});
+            return 1;
+        };
+
+        children.appendAssumeCapacity(child_proc);
+
+        if (child_proc.stdout) |f| {
+            out_pipe_fds.appendAssumeCapacity(f.handle);
+        }
+
+        if (child_proc.stderr) |f| {
+            err_pipe_fds.appendAssumeCapacity(f.handle);
+        }
+    }
+
+    const epoller = std.posix.epoll_create1(0) catch |err| {
+        try stderr.print("Error creating epoll '{s}'\n", .{@errorName(err)});
+        return 1;
+    };
+
+    for (out_pipe_fds.items, 0..) |fd, i| {
+        var event = std.os.linux.epoll_event{
+            .events = std.os.linux.EPOLL.IN, // let us know when we can read from the pipe
+            .data = std.os.linux.epoll_data{ .u64 = i + 1 },
+        };
+        std.posix.epoll_ctl(epoller, std.os.linux.EPOLL.CTL_ADD, fd, &event) catch |err| {
+            try stderr.print("Error adding stdout pipe to epoll '{s}'\n", .{@errorName(err)});
+            return 1;
+        };
+    }
+
+    for (err_pipe_fds.items, 0..) |fd, i| {
+        var event = std.os.linux.epoll_event{
+            .events = std.os.linux.EPOLL.IN, // let us know when we can read from the pipe
+            .data = std.os.linux.epoll_data{ .u64 = (i + 1) << 32 },
+        };
+        std.posix.epoll_ctl(epoller, std.os.linux.EPOLL.CTL_ADD, fd, &event) catch |err| {
+            try stderr.print("Error adding stderr pipe to epoll '{s}'\n", .{@errorName(err)});
+            return 1;
+        };
+    }
+
+    var buffers = std.ArrayList(std.io.FixedBufferStream([]u8)).initCapacity(alloc, commands.items.len * 2) catch |err| {
+        try stderr.print("Error initializing buffers list '{s}'\n", .{@errorName(err)});
+        return 1;
+    };
+    // create all of the buffers
+    for (0..commands.items.len * 2) |_| {
+        const buf = std.io.fixedBufferStream(try alloc.alloc(u8, 4096));
+        buffers.appendAssumeCapacity(buf);
+    }
+
+    var events = std.ArrayList(std.os.linux.epoll_event).initCapacity(alloc, commands.items.len * 2) catch |err| {
+        try stderr.print("Error initializing epoll events list '{s}'\n", .{@errorName(err)});
+        return 1;
+    };
+
+    for (0..commands.items.len * 2) |_| {
+        const e: std.os.linux.epoll_event = undefined;
+        events.appendAssumeCapacity(e);
+    }
+
+    var line_buffer = std.io.fixedBufferStream(try alloc.alloc(u8, 4096));
+    var line_writer = line_buffer.writer();
+
+    const orig_event_len = events.items.len;
+
+    whileepoll: while (true) {
+        events.resize(orig_event_len) catch |err| {
+            stderr.print("Error resizing events list '{s}'\n", .{@errorName(err)}) catch unreachable;
+        };
+        const event_count = std.posix.epoll_wait(epoller, events.items, 5000);
+
+        if (event_count == 0) {
+            continue :whileepoll;
+        }
+
+        events.resize(event_count) catch |err| {
+            try stderr.print("Error resizing events list '{s}'\n", .{@errorName(err)});
+            return 1;
+        };
+
+        forevents: for (events.items) |e| {
+            var idx = e.data.u64;
+            var out_type: u8 = 0;
+            var buf: std.io.FixedBufferStream([]u8) = undefined;
+            var fd: std.posix.fd_t = 0;
+            if (idx >= std.math.maxInt(u32)) {
+                // stderr
+                idx >>= 32;
+                idx -= 1;
+                out_type = 1;
+                buf = buffers.items[(idx * 2) + 1];
+                fd = err_pipe_fds.items[idx];
+            } else {
+                // stdout
+                idx -= 1;
+                out_type = 2;
+                buf = buffers.items[idx];
+                fd = out_pipe_fds.items[idx];
+            }
+            const label = opts.targetLabels.items[idx];
+
+            var tmp: [4096]u8 = undefined;
+            const read_count = std.posix.read(fd, &tmp) catch |err| {
+                try stderr.print("Error reading from pipe '{s}'\n", .{@errorName(err)});
+                return 1;
+            };
+
+            if (read_count == 0) {
+                // this means EOF, so pipe is closed?
+                std.posix.epoll_ctl(epoller, std.os.linux.EPOLL.CTL_DEL, fd, null) catch |err| {
+                    try stderr.print("Error removing pipe from epoll '{s}'\n", .{@errorName(err)});
+                    return 1;
+                };
+                // TODO output something about the child process exiting and maybe its exit code if we know it
+            } else {
+                // does tmp contain a newline? or more than one?
+                var start: u16 = 0;
+                var out_lines: u16 = 0;
+                defer line_buffer.reset();
+                while (true) {
+                    const new_line_pos = std.mem.indexOf(u8, tmp[start..read_count], "\n");
+                    if (new_line_pos == null) {
+                        // no newline store in buffer for now
+                        const write_count = buf.write(tmp[start..read_count]) catch |err| {
+                            try stderr.print("Error writing to fd buffer '{s}'\n", .{@errorName(err)});
+                            return 1;
+                        };
+                        if (write_count != tmp[start..read_count].len) {
+                            try stderr.print("Error writing to fd buffer, wrote {d} of {d} bytes\n", .{ write_count, read_count - start });
+                            return 1;
+                        }
+                        break;
+                    }
+
+                    out_lines += 1;
+                    line_writer.print("{s}: {s}{s}\n", .{ label, buf.getWritten(), tmp[start..new_line_pos.?] }) catch |err| {
+                        try stderr.print("Error formatting line '{s}'\n", .{@errorName(err)});
+                        return 1;
+                    };
+                    buf.reset();
+
+                    start = @as(u16, @intCast(new_line_pos.?)) + 1;
+                }
+
+                if (out_lines == 0) {
+                    continue :forevents;
+                }
+
+                if (out_type == 0) {
+                    const lb = line_buffer.getWritten();
+                    const written_count = std.os.linux.write(std.os.linux.STDOUT_FILENO, lb.ptr, lb.len);
+                    if (written_count != lb.len) {
+                        try stderr.print("Error writing to stdout, wrote {d} of {d} bytes\n", .{ written_count, lb.len });
+                        return 1;
+                    }
+                } else {
+                    const lb = line_buffer.getWritten();
+                    const written_count = std.os.linux.write(std.os.linux.STDERR_FILENO, lb.ptr, lb.len);
+                    if (written_count != lb.len) {
+                        try stderr.print("Error writing to stderr, wrote {d} of {d} bytes\n", .{ written_count, lb.len });
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+
+    return 0;
 }
 
 const OptionErrors = std.ArrayList([]const u8);
@@ -110,7 +299,15 @@ fn getOptions(alloc: std.mem.Allocator, args: anytype, opts: *Options, optsError
                 try optsErrors.append(message);
             }
         } else {
-            opts.targetLabel = arg;
+            opts.targetLabels.append(arg) catch |err| {
+                const message = try std.fmt.allocPrint(
+                    alloc,
+                    "Error adding target label '{s}', '{s}'",
+                    .{ arg, @errorName(err) },
+                );
+
+                try optsErrors.append(message);
+            };
         }
     }
     if (optsErrors.items.len > 0) {
@@ -205,6 +402,100 @@ fn getCmdFromProcfile(alloc: std.mem.Allocator, reader: anytype, targetLabel: []
     return error.LabelNotFound;
 }
 
+fn getCmdsFromProcfile(alloc: std.mem.Allocator, reader: anytype, targetLabels: [][]const u8) !std.ArrayList([]u8) {
+    const buf = try alloc.alloc(u8, 1024);
+    defer alloc.free(buf);
+
+    var cmds = std.ArrayList([]u8).initCapacity(alloc, targetLabels.len) catch |err| {
+        return err;
+    };
+    cmds.resize(targetLabels.len) catch |err| {
+        return err;
+    };
+    var found: u8 = 0;
+
+    var bufStream = std.io.fixedBufferStream(buf);
+
+    const reading = true;
+
+    readingFile: while (reading) {
+        bufStream.reset();
+        reader.streamUntilDelimiter(bufStream.writer(), ':', null) catch |err| switch (err) {
+            error.EndOfStream => {
+                return error.LabelNotFound;
+            },
+            else => {
+                return err;
+            },
+        };
+
+        const labelRaw = bufStream.getWritten();
+        const label = std.mem.trim(u8, labelRaw, &std.ascii.whitespace);
+
+        var labelMatched = false;
+        checkLabels: for (0.., targetLabels) |targetIndex, item| {
+            // print
+            if (std.mem.eql(u8, label, item)) {
+                labelMatched = true;
+                found += 1;
+                // label match found
+                bufStream.reset();
+                var bufWriter = bufStream.writer();
+                // Skip whitespace
+                while (true) {
+                    const b = reader.readByte() catch |err| {
+                        switch (err) {
+                            error.EndOfStream => {
+                                return error.EmptyCmd;
+                            },
+                            else => {
+                                return err;
+                            },
+                        }
+                    };
+                    if (b == '\n') {
+                        return error.EmptyCmd;
+                    }
+                    if (!std.ascii.isWhitespace(b)) {
+                        try bufWriter.writeByte(b);
+                        break;
+                    }
+                }
+
+                // Read the rest until end of line
+                reader.streamUntilDelimiter(bufWriter, '\n', null) catch |err| switch (err) {
+                    error.EndOfStream => {
+                        // this is ok, continue on
+                    },
+                    else => {
+                        return err;
+                    },
+                };
+                try bufWriter.writeByte('\n');
+                const procCmd = bufStream.getWritten();
+
+                const cmd = try alloc.dupe(u8, procCmd);
+                cmds.items[targetIndex] = cmd;
+                break :checkLabels;
+            }
+        }
+
+        if (!labelMatched) {
+            try reader.skipUntilDelimiterOrEof('\n');
+        }
+
+        if (found == targetLabels.len) {
+            break :readingFile;
+        }
+    }
+
+    if (found != targetLabels.len) {
+        return error.LabelNotFound;
+    }
+
+    return cmds;
+}
+
 const ArgPtrsStruct = struct { args: [MAX_ARGS:null]?[*:0]u8, len: usize };
 
 // cmd must end with \n
@@ -268,13 +559,72 @@ fn cmdToArgPtrs(cmd: []u8) ArgPtrsStruct {
     };
 }
 
+fn cmdToArgs(alloc: std.mem.Allocator, cmd: []const u8) !std.ArrayList([]const u8) {
+    var inQuotes = false;
+    var openQuote: ?u8 = null;
+    var argStart: usize = 0;
+    var argIndex: u8 = 0;
+
+    var args: std.ArrayList([]const u8) = std.ArrayList([]const u8).init(alloc);
+
+    for (cmd, 0..) |char, i| {
+        if (char == '"' or char == '\'') {
+            if (inQuotes) {
+                if (char == openQuote) {
+                    // end quote
+                    const arg = cmd[argStart..i];
+                    args.append(arg) catch |err| {
+                        std.debug.print("Error adding arg '{s}'\n", .{@errorName(err)});
+                        return error.OutOfMemory;
+                    };
+                    argStart = i + 1;
+                    argIndex += 1;
+
+                    inQuotes = false;
+                    openQuote = null;
+                    continue;
+                } else {
+                    // quote inside quote, continue
+                    continue;
+                }
+            } else {
+                inQuotes = true;
+                openQuote = char;
+                argStart = i + 1;
+                continue;
+            }
+        }
+
+        if (std.ascii.isWhitespace(char)) {
+            if (inQuotes) {
+                continue;
+            } else {
+                if (argStart == i) {
+                    // we are at the space after a quoted section, bump arg start and move on
+                    argStart = i + 1;
+                } else {
+                    const arg = cmd[argStart..i];
+                    args.append(arg) catch |err| {
+                        std.debug.print("Error adding arg '{s}'\n", .{@errorName(err)});
+                        return error.OutOfMemory;
+                    };
+                    argStart = i + 1;
+                    argIndex += 1;
+                }
+            }
+        }
+    }
+
+    return args;
+}
+
 test "getOptions" {
     const alloc = std.testing.allocator;
 
     const base_opts = Options{
         .selfName = "initial value",
         .procfileName = "initial value",
-        .targetLabel = "initial value",
+        .targetLabels = .{"initial value"},
     };
 
     const tests = .{
@@ -320,7 +670,7 @@ test "getOptions" {
 
         // std.debug.print("XXXXXXX {any} '{s}' {any} '{s}'\n", .{ @TypeOf(expected_procfilename), expected_procfilename, @TypeOf(opts.procfileName), opts.procfileName });
         try std.testing.expectEqualStrings(expected_procfilename, opts.procfileName);
-        try std.testing.expectEqualStrings(expected_label, opts.targetLabel);
+        try std.testing.expectEqualStrings(.{expected_label}, opts.targetLabels);
         std.debug.print("done\n", .{});
         alloc.free(args);
     }

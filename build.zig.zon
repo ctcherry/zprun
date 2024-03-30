@@ -8,9 +8,5 @@
         "LICENSE",
     },
     .dependencies = .{
-        .libxev = .{
-            .url = "https://github.com/mitchellh/libxev/archive/main.tar.gz",
-            .hash = "12203dcbe098ee49ea242432cd198b1ca557626988f056bea86630dcfe8660244407",
-        },
     },
 }
