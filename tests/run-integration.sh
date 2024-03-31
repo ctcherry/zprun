@@ -9,6 +9,7 @@ label0: ls -la
 label1: /bin/bash -c "echo hello"
 EOF
 
+pwd 
 test() {
   name=$1
   label=$2
@@ -21,8 +22,9 @@ test() {
   fi
 }
 
-test "basic" "label0" "build.zig"
-test "error missing label" "missing" "Unable to find label"
+test "basic1" "label0" "build.zig"
+test "basic2" "label1" "hello"
+test "error missing label" "missing" "Unable to find all labels in procfile"
 
 echo -n "Test error when no param for -f: "
 if $bin "label0" -f 2>&1 | grep -q "Missing argument for -f"; then

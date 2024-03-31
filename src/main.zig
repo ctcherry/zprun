@@ -160,11 +160,14 @@ pub fn main() !u8 {
 
     var line_buffer = std.io.fixedBufferStream(try alloc.alloc(u8, 4096));
     var line_writer = line_buffer.writer();
+    var closed_pipes: [64]u8 = undefined;
+    @memset(&closed_pipes, 0);
 
     const orig_event_len = events.items.len;
+    var current_event_len = orig_event_len;
 
     whileepoll: while (true) {
-        events.resize(orig_event_len) catch |err| {
+        events.resize(current_event_len) catch |err| {
             stderr.print("Error resizing events list '{s}'\n", .{@errorName(err)}) catch unreachable;
         };
         const event_count = std.posix.epoll_wait(epoller, events.items, 5000);
@@ -198,20 +201,52 @@ pub fn main() !u8 {
                 fd = out_pipe_fds.items[idx];
             }
             const label = opts.targetLabels.items[idx];
-
-            var tmp: [4096]u8 = undefined;
-            const read_count = std.posix.read(fd, &tmp) catch |err| {
-                try stderr.print("Error reading from pipe '{s}'\n", .{@errorName(err)});
-                return 1;
-            };
-
-            if (read_count == 0) {
-                // this means EOF, so pipe is closed?
+            std.debug.print("label: {s} idx: {d} out_type: {d} event type: {d}\n", .{ label, idx, out_type, e.events });
+            if (e.events & std.os.linux.EPOLL.HUP != 0) {
+                closed_pipes[idx] += out_type;
+                // pipe closed so remove epoll monitoring of it
                 std.posix.epoll_ctl(epoller, std.os.linux.EPOLL.CTL_DEL, fd, null) catch |err| {
                     try stderr.print("Error removing pipe from epoll '{s}'\n", .{@errorName(err)});
                     return 1;
                 };
-                // TODO output something about the child process exiting and maybe its exit code if we know it
+            }
+
+            var tmp: [4096]u8 = undefined;
+            const read_count = std.posix.read(fd, &tmp) catch 0;
+
+            if (read_count == 0) {
+                // this means EOF, so pipe is closed and no more data will be coming
+                if (closed_pipes[idx] == 3) {
+                    // we are about to act on the child process, lets only do it once both stdout and stderr are closed
+                    current_event_len -= 2;
+                    var child = children.items[idx];
+                    if (child.term) |term| {
+                        std.debug.print("child '{s}' already terminated {any}\n", .{ label, term });
+                    } else {
+                        const term = child.wait() catch |err| {
+                            try stderr.print("Error waiting for child '{s}'\n", .{@errorName(err)});
+                            return 1;
+                        };
+                        switch (term) {
+                            .Exited => |exit_code| {
+                                try stderr.print("{s}:exit: exited with code {d}\n", .{ label, exit_code });
+                            },
+                            .Signal => |signal| {
+                                try stderr.print("{s}:sig: terminated with signal {d} ({s})\n", .{ label, signal, signalToString(signal) });
+                            },
+                            .Stopped => |signal| {
+                                try stderr.print("{s}:sig: stopped with signal {d} ({s})\n", .{ label, signal, signalToString(signal) });
+                            },
+                            .Unknown => |signal| {
+                                try stderr.print("{s}:sig: unknown happened with signal {d} ({s})\n", .{ label, signal, signalToString(signal) });
+                            },
+                        }
+                    }
+                }
+                std.debug.print("current_event_len: {d}", .{current_event_len});
+                if (current_event_len == 0) {
+                    break :whileepoll;
+                }
             } else {
                 // does tmp contain a newline? or more than one?
                 var start: u16 = 0;
@@ -231,15 +266,17 @@ pub fn main() !u8 {
                         }
                         break;
                     }
+                    const abs_new_line_pos = new_line_pos.? + start;
 
                     out_lines += 1;
-                    line_writer.print("{s}: {s}{s}\n", .{ label, buf.getWritten(), tmp[start..new_line_pos.?] }) catch |err| {
+                    const out_name = if (out_type == 2) "out" else "err";
+                    line_writer.print("{s}:{s}: {s}{s}\n", .{ label, out_name, buf.getWritten(), tmp[start..abs_new_line_pos] }) catch |err| {
                         try stderr.print("Error formatting line '{s}'\n", .{@errorName(err)});
                         return 1;
                     };
                     buf.reset();
 
-                    start = @as(u16, @intCast(new_line_pos.?)) + 1;
+                    start = @as(u16, @intCast(abs_new_line_pos)) + 1;
                 }
 
                 if (out_lines == 0) {
@@ -314,6 +351,74 @@ fn getOptions(alloc: std.mem.Allocator, args: anytype, opts: *Options, optsError
         return error.OptionErrors;
     }
     return void{};
+}
+
+pub fn signalToString(signal: u32) []const u8 {
+    return switch (signal) {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        4 => "SIGILL",
+        5 => "SIGTRAP",
+        6 => "SIGABRT",
+        7 => "SIGBUS",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        10 => "SIGUSR1",
+        11 => "SIGSEGV",
+        12 => "SIGUSR2",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        16 => "SIGSTKFLT",
+        17 => "SIGCHLD",
+        18 => "SIGCONT",
+        19 => "SIGSTOP",
+        20 => "SIGTSTP",
+        21 => "SIGTTIN",
+        22 => "SIGTTOU",
+        23 => "SIGURG",
+        24 => "SIGXCPU",
+        25 => "SIGXFSZ",
+        26 => "SIGVTALRM",
+        27 => "SIGPROF",
+        28 => "SIGWINCH",
+        29 => "SIGIO",
+        30 => "SIGPWR",
+        31 => "SIGSYS",
+        34 => "SIGRTMIN",
+        35 => "SIGRTMIN+1",
+        36 => "SIGRTMIN+2",
+        37 => "SIGRTMIN+3",
+        38 => "SIGRTMIN+4",
+        39 => "SIGRTMIN+5",
+        40 => "SIGRTMIN+6",
+        41 => "SIGRTMIN+7",
+        42 => "SIGRTMIN+8",
+        43 => "SIGRTMIN+9",
+        44 => "SIGRTMIN+10",
+        45 => "SIGRTMIN+11",
+        46 => "SIGRTMIN+12",
+        47 => "SIGRTMIN+13",
+        48 => "SIGRTMIN+14",
+        49 => "SIGRTMIN+15",
+        50 => "SIGRTMAX-14",
+        51 => "SIGRTMAX-13",
+        52 => "SIGRTMAX-12",
+        53 => "SIGRTMAX-11",
+        54 => "SIGRTMAX-10",
+        55 => "SIGRTMAX-9",
+        56 => "SIGRTMAX-8",
+        57 => "SIGRTMAX-7",
+        58 => "SIGRTMAX-6",
+        59 => "SIGRTMAX-5",
+        60 => "SIGRTMAX-4",
+        61 => "SIGRTMAX-3",
+        62 => "SIGRTMAX-2",
+        63 => "SIGRTMAX-1",
+        64 => "SIGRTMAX",
+        else => "Unknown Signal",
+    };
 }
 
 fn execCmd(cmd: []u8) !void {
