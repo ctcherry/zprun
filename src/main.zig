@@ -220,28 +220,7 @@ pub fn main() !u8 {
                     // we are about to act on the child process, lets only do it once both stdout and stderr are closed
                     current_event_len -= 2;
                     var child = children.items[idx];
-                    if (child.term) |term| {
-                        std.debug.print("child '{s}' already terminated {any}\n", .{ label, term });
-                    } else {
-                        const term = child.wait() catch |err| {
-                            try stderr.print("Error waiting for child '{s}'\n", .{@errorName(err)});
-                            return 1;
-                        };
-                        switch (term) {
-                            .Exited => |exit_code| {
-                                try stderr.print("{s}:exit: exited with code {d}\n", .{ label, exit_code });
-                            },
-                            .Signal => |signal| {
-                                try stderr.print("{s}:sig: terminated with signal {d} ({s})\n", .{ label, signal, signalToString(signal) });
-                            },
-                            .Stopped => |signal| {
-                                try stderr.print("{s}:sig: stopped with signal {d} ({s})\n", .{ label, signal, signalToString(signal) });
-                            },
-                            .Unknown => |signal| {
-                                try stderr.print("{s}:sig: unknown happened with signal {d} ({s})\n", .{ label, signal, signalToString(signal) });
-                            },
-                        }
-                    }
+                    try childShutdown(label, &child);
                 }
                 std.debug.print("current_event_len: {d}", .{current_event_len});
                 if (current_event_len == 0) {
@@ -303,6 +282,32 @@ pub fn main() !u8 {
     }
 
     return 0;
+}
+
+fn childShutdown(label: []const u8, child: *std.ChildProcess) !void {
+    const stderr = std.io.getStdErr().writer();
+    if (child.term) |term| {
+        std.debug.print("child '{s}' already terminated {any}\n", .{ label, term });
+    } else {
+        const term = child.wait() catch |err| {
+            try stderr.print("Error waiting for child '{s}'\n", .{@errorName(err)});
+            return err;
+        };
+        switch (term) {
+            .Exited => |exit_code| {
+                try stderr.print("{s}:exit: exited with code {d}\n", .{ label, exit_code });
+            },
+            .Signal => |signal| {
+                try stderr.print("{s}:sig: terminated with signal {d} ({s})\n", .{ label, signal, signalToString(signal) });
+            },
+            .Stopped => |signal| {
+                try stderr.print("{s}:sig: stopped with signal {d} ({s})\n", .{ label, signal, signalToString(signal) });
+            },
+            .Unknown => |signal| {
+                try stderr.print("{s}:sig: unknown happened with signal {d} ({s})\n", .{ label, signal, signalToString(signal) });
+            },
+        }
+    }
 }
 
 const OptionErrors = std.ArrayList([]const u8);
