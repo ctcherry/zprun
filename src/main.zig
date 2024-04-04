@@ -1,4 +1,6 @@
 const std = @import("std");
+const Procfile = @import("procfile.zig").Procfile;
+const MultiProcessRunner = @import("runner.zig").MultiProcessRunner;
 
 const DEBUG = false;
 const MAX_ARGS = 100;
@@ -36,7 +38,7 @@ pub fn main() !u8 {
         return 1;
     };
 
-    var procfile = std.fs.cwd().openFile(opts.procfileName, .{}) catch |err| {
+    var procfile = Procfile.open(opts.procfileName) catch |err| {
         switch (err) {
             error.FileNotFound => {
                 try stderr.print("Error: File '{s}' for procfile not found\n", .{opts.procfileName});
@@ -54,10 +56,7 @@ pub fn main() !u8 {
         return 1;
     }
 
-    var procfileBufReader_ = std.io.bufferedReader(procfile.reader());
-    const procfileBufReader = procfileBufReader_.reader();
-
-    const commands = getCmdsFromProcfile(alloc, procfileBufReader, opts.targetLabels.items) catch |err| {
+    const commands = procfile.cmdsForLabels(alloc, opts.targetLabels.items) catch |err| {
         switch (err) {
             error.LabelNotFound => {
                 try stderr.print("Error: Unable to find all labels in procfile '{s}'\n", .{opts.procfileName});
@@ -72,214 +71,11 @@ pub fn main() !u8 {
         return 1;
     };
 
-    var out_pipe_fds = std.ArrayList(std.posix.fd_t).initCapacity(alloc, commands.items.len) catch |err| {
-        try stderr.print("Error initializing stdout pipes list '{s}'\n", .{@errorName(err)});
-        return 1;
-    };
-
-    var err_pipe_fds = std.ArrayList(std.posix.fd_t).initCapacity(alloc, commands.items.len) catch |err| {
-        try stderr.print("Error initializing stderr pipes list '{s}'\n", .{@errorName(err)});
-        return 1;
-    };
-
-    var children = std.ArrayList(std.ChildProcess).initCapacity(alloc, commands.items.len) catch |err| {
-        try stderr.print("Error initializing children list '{s}'\n", .{@errorName(err)});
-        return 1;
-    };
-
-    for (commands.items) |command| {
-        var cmd_args = try cmdToArgs(alloc, command);
-        const cmd_args_owned = try cmd_args.toOwnedSlice();
-        var child_proc = std.ChildProcess.init(cmd_args_owned, alloc);
-        child_proc.stdout_behavior = .Pipe;
-        child_proc.stderr_behavior = .Pipe;
-        child_proc.stdin_behavior = .Ignore;
-
-        child_proc.spawn() catch |err| {
-            try stderr.print("Error spawning child process '{s}'\n", .{@errorName(err)});
-            return 1;
-        };
-
-        children.appendAssumeCapacity(child_proc);
-
-        if (child_proc.stdout) |f| {
-            out_pipe_fds.appendAssumeCapacity(f.handle);
-        }
-
-        if (child_proc.stderr) |f| {
-            err_pipe_fds.appendAssumeCapacity(f.handle);
-        }
+    var runner = try MultiProcessRunner.initCapacity(alloc, commands.items.len);
+    for (0..commands.items.len) |i| {
+        try runner.addProcessAssumeCapacity(opts.targetLabels.items[i], commands.items[i]);
     }
-
-    const epoller = std.posix.epoll_create1(0) catch |err| {
-        try stderr.print("Error creating epoll '{s}'\n", .{@errorName(err)});
-        return 1;
-    };
-
-    for (out_pipe_fds.items, 0..) |fd, i| {
-        var event = std.os.linux.epoll_event{
-            .events = std.os.linux.EPOLL.IN, // let us know when we can read from the pipe
-            .data = std.os.linux.epoll_data{ .u64 = i + 1 },
-        };
-        std.posix.epoll_ctl(epoller, std.os.linux.EPOLL.CTL_ADD, fd, &event) catch |err| {
-            try stderr.print("Error adding stdout pipe to epoll '{s}'\n", .{@errorName(err)});
-            return 1;
-        };
-    }
-
-    for (err_pipe_fds.items, 0..) |fd, i| {
-        var event = std.os.linux.epoll_event{
-            .events = std.os.linux.EPOLL.IN, // let us know when we can read from the pipe
-            .data = std.os.linux.epoll_data{ .u64 = (i + 1) << 32 },
-        };
-        std.posix.epoll_ctl(epoller, std.os.linux.EPOLL.CTL_ADD, fd, &event) catch |err| {
-            try stderr.print("Error adding stderr pipe to epoll '{s}'\n", .{@errorName(err)});
-            return 1;
-        };
-    }
-
-    var buffers = std.ArrayList(std.io.FixedBufferStream([]u8)).initCapacity(alloc, commands.items.len * 2) catch |err| {
-        try stderr.print("Error initializing buffers list '{s}'\n", .{@errorName(err)});
-        return 1;
-    };
-    // create all of the buffers
-    for (0..commands.items.len * 2) |_| {
-        const buf = std.io.fixedBufferStream(try alloc.alloc(u8, 4096));
-        buffers.appendAssumeCapacity(buf);
-    }
-
-    var events = std.ArrayList(std.os.linux.epoll_event).initCapacity(alloc, commands.items.len * 2) catch |err| {
-        try stderr.print("Error initializing epoll events list '{s}'\n", .{@errorName(err)});
-        return 1;
-    };
-
-    for (0..commands.items.len * 2) |_| {
-        const e: std.os.linux.epoll_event = undefined;
-        events.appendAssumeCapacity(e);
-    }
-
-    var line_buffer = std.io.fixedBufferStream(try alloc.alloc(u8, 4096));
-    var line_writer = line_buffer.writer();
-    var closed_pipes: [64]u8 = undefined;
-    @memset(&closed_pipes, 0);
-
-    const orig_event_len = events.items.len;
-    var current_event_len = orig_event_len;
-
-    whileepoll: while (true) {
-        events.resize(current_event_len) catch |err| {
-            stderr.print("Error resizing events list '{s}'\n", .{@errorName(err)}) catch unreachable;
-        };
-        const event_count = std.posix.epoll_wait(epoller, events.items, 5000);
-
-        if (event_count == 0) {
-            continue :whileepoll;
-        }
-
-        events.resize(event_count) catch |err| {
-            try stderr.print("Error resizing events list '{s}'\n", .{@errorName(err)});
-            return 1;
-        };
-
-        forevents: for (events.items) |e| {
-            var idx = e.data.u64;
-            var out_type: u8 = 0;
-            var buf: std.io.FixedBufferStream([]u8) = undefined;
-            var fd: std.posix.fd_t = 0;
-            if (idx >= std.math.maxInt(u32)) {
-                // stderr
-                idx >>= 32;
-                idx -= 1;
-                out_type = 1;
-                buf = buffers.items[(idx * 2) + 1];
-                fd = err_pipe_fds.items[idx];
-            } else {
-                // stdout
-                idx -= 1;
-                out_type = 2;
-                buf = buffers.items[idx];
-                fd = out_pipe_fds.items[idx];
-            }
-            const label = opts.targetLabels.items[idx];
-            std.debug.print("label: {s} idx: {d} out_type: {d} event type: {d}\n", .{ label, idx, out_type, e.events });
-            if (e.events & std.os.linux.EPOLL.HUP != 0) {
-                closed_pipes[idx] += out_type;
-                // pipe closed so remove epoll monitoring of it
-                std.posix.epoll_ctl(epoller, std.os.linux.EPOLL.CTL_DEL, fd, null) catch |err| {
-                    try stderr.print("Error removing pipe from epoll '{s}'\n", .{@errorName(err)});
-                    return 1;
-                };
-            }
-
-            var tmp: [4096]u8 = undefined;
-            const read_count = std.posix.read(fd, &tmp) catch 0;
-
-            if (read_count == 0) {
-                // this means EOF, so pipe is closed and no more data will be coming
-                if (closed_pipes[idx] == 3) {
-                    // we are about to act on the child process, lets only do it once both stdout and stderr are closed
-                    current_event_len -= 2;
-                    var child = children.items[idx];
-                    try childShutdown(label, &child);
-                }
-                std.debug.print("current_event_len: {d}", .{current_event_len});
-                if (current_event_len == 0) {
-                    break :whileepoll;
-                }
-            } else {
-                // does tmp contain a newline? or more than one?
-                var start: u16 = 0;
-                var out_lines: u16 = 0;
-                defer line_buffer.reset();
-                while (true) {
-                    const new_line_pos = std.mem.indexOf(u8, tmp[start..read_count], "\n");
-                    if (new_line_pos == null) {
-                        // no newline store in buffer for now
-                        const write_count = buf.write(tmp[start..read_count]) catch |err| {
-                            try stderr.print("Error writing to fd buffer '{s}'\n", .{@errorName(err)});
-                            return 1;
-                        };
-                        if (write_count != tmp[start..read_count].len) {
-                            try stderr.print("Error writing to fd buffer, wrote {d} of {d} bytes\n", .{ write_count, read_count - start });
-                            return 1;
-                        }
-                        break;
-                    }
-                    const abs_new_line_pos = new_line_pos.? + start;
-
-                    out_lines += 1;
-                    const out_name = if (out_type == 2) "out" else "err";
-                    line_writer.print("{s}:{s}: {s}{s}\n", .{ label, out_name, buf.getWritten(), tmp[start..abs_new_line_pos] }) catch |err| {
-                        try stderr.print("Error formatting line '{s}'\n", .{@errorName(err)});
-                        return 1;
-                    };
-                    buf.reset();
-
-                    start = @as(u16, @intCast(abs_new_line_pos)) + 1;
-                }
-
-                if (out_lines == 0) {
-                    continue :forevents;
-                }
-
-                if (out_type == 0) {
-                    const lb = line_buffer.getWritten();
-                    const written_count = std.os.linux.write(std.os.linux.STDOUT_FILENO, lb.ptr, lb.len);
-                    if (written_count != lb.len) {
-                        try stderr.print("Error writing to stdout, wrote {d} of {d} bytes\n", .{ written_count, lb.len });
-                        return 1;
-                    }
-                } else {
-                    const lb = line_buffer.getWritten();
-                    const written_count = std.os.linux.write(std.os.linux.STDERR_FILENO, lb.ptr, lb.len);
-                    if (written_count != lb.len) {
-                        try stderr.print("Error writing to stderr, wrote {d} of {d} bytes\n", .{ written_count, lb.len });
-                        return 1;
-                    }
-                }
-            }
-        }
-    }
+    try runner.run();
 
     return 0;
 }
