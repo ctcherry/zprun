@@ -3,8 +3,6 @@ const Procfile = @import("procfile.zig").Procfile;
 const MultiProcessRunner = @import("runner.zig").MultiProcessRunner;
 const MultiProcessRunnerMemoryNeeds = @import("runner.zig").totalMemoryNeeded;
 
-const DEBUG = false;
-const MAX_ARGS = 100;
 const MAX_PARALLEL_PROCESSES = 32;
 const DEFAULT_PROCFILE_NAME = "Procfile";
 

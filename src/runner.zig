@@ -3,7 +3,7 @@ const std = @import("std");
 const LINE_BUFFER_SIZE = 8192 + 1024;
 const BUFFER_SIZE = 8192;
 const EPOLL_WAIT = 5000;
-const ARG_MAX = 131072;
+const ARG_MAX = 128 * 1024;
 
 fn perProcessMemoryNeeds() usize {
     const double = 2 * (BUFFER_SIZE + @sizeOf(std.io.FixedBufferStream([]u8)) + @sizeOf(std.os.linux.epoll_event) + @sizeOf(std.posix.fd_t));
