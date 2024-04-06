@@ -3,6 +3,18 @@ const std = @import("std");
 const LINE_BUFFER_SIZE = 8192 + 1024;
 const BUFFER_SIZE = 8192;
 const EPOLL_WAIT = 5000;
+const ARG_MAX = 131072;
+
+fn perProcessMemoryNeeds() usize {
+    const double = 2 * (BUFFER_SIZE + @sizeOf(std.io.FixedBufferStream([]u8)) + @sizeOf(std.os.linux.epoll_event) + @sizeOf(std.posix.fd_t));
+    return double + @sizeOf([]u8) + @sizeOf(u2) + @sizeOf(std.ChildProcess) + ARG_MAX;
+}
+
+pub fn totalMemoryNeeded(comptime n: usize) usize {
+    const variable_usage = n * perProcessMemoryNeeds();
+    const fixed_usage = @sizeOf(std.io.FixedBufferStream([LINE_BUFFER_SIZE]u8));
+    return variable_usage + fixed_usage;
+}
 
 pub const MultiProcessRunner = struct {
     alloc: std.mem.Allocator,
