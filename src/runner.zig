@@ -239,7 +239,7 @@ pub const MultiProcessRunner = struct {
 
     fn spawn_and_setup_epoll(self: *MultiProcessRunner) !void {
         for (0..self.len) |i| {
-            var child_proc = self.children[i];
+            var child_proc = &self.children[i];
             try child_proc.spawn();
 
             var setup_fds: [2]struct { fd: std.posix.fd_t, id: u64 } = undefined;
@@ -274,11 +274,12 @@ pub const MultiProcessRunner = struct {
 
     fn childShutdown(self: *MultiProcessRunner, idx: usize) !void {
         const label = self.labels[idx];
-        var child = self.children[idx];
+        var child = &self.children[idx];
         const stderr = std.io.getStdErr().writer();
         if (child.term) |term| {
             std.debug.print("child '{s}' already terminated {any}\n", .{ label, term });
         } else {
+            std.debug.print("wait terminating child '{s}'\n", .{label});
             const term = child.wait() catch |err| {
                 try stderr.print("Error waiting for child '{s}'\n", .{@errorName(err)});
                 return err;
