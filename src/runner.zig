@@ -1,5 +1,9 @@
 const std = @import("std");
 
+const LINE_BUFFER_SIZE = 8192 + 1024;
+const BUFFER_SIZE = 8192;
+const EPOLL_WAIT = 5000;
+
 pub const MultiProcessRunner = struct {
     alloc: std.mem.Allocator,
 
@@ -28,11 +32,11 @@ pub const MultiProcessRunner = struct {
         const out_bufs = try alloc.alloc(std.io.FixedBufferStream([]u8), size);
         const err_bufs = try alloc.alloc(std.io.FixedBufferStream([]u8), size);
 
-        const line_buffer = std.io.fixedBufferStream(try alloc.alloc(u8, 8192));
+        const line_buffer = std.io.fixedBufferStream(try alloc.alloc(u8, LINE_BUFFER_SIZE));
 
         for (0..size) |b| {
-            out_bufs[b] = std.io.fixedBufferStream(try alloc.alloc(u8, 4096));
-            err_bufs[b] = std.io.fixedBufferStream(try alloc.alloc(u8, 4096));
+            out_bufs[b] = std.io.fixedBufferStream(try alloc.alloc(u8, BUFFER_SIZE));
+            err_bufs[b] = std.io.fixedBufferStream(try alloc.alloc(u8, BUFFER_SIZE));
         }
 
         const labels = try alloc.alloc([]u8, size);
@@ -79,7 +83,7 @@ pub const MultiProcessRunner = struct {
         const events = try self.alloc.alloc(std.os.linux.epoll_event, self.len * 2); // times 2 here becuase stdout and stderr for each process
 
         whileepoll: while (self.epoll_is_any()) {
-            const event_count = std.posix.epoll_wait(self.epoll_fd, events, 5000);
+            const event_count = std.posix.epoll_wait(self.epoll_fd, events, EPOLL_WAIT);
             if (event_count == 0) {
                 continue :whileepoll;
             }
@@ -114,7 +118,7 @@ pub const MultiProcessRunner = struct {
         var line_writer = self.line_buffer.writer();
 
         reading: while (true) {
-            var tmp: [4096]u8 = undefined;
+            var tmp: [BUFFER_SIZE]u8 = undefined;
             const read_count = std.posix.read(fd, &tmp) catch 0;
             std.debug.print("read {d} bytes from fd {d}\n", .{ read_count, fd });
             if (read_count == 0) {
