@@ -28,7 +28,7 @@ pub const MultiProcessRunner = struct {
         const out_bufs = try alloc.alloc(std.io.FixedBufferStream([]u8), size);
         const err_bufs = try alloc.alloc(std.io.FixedBufferStream([]u8), size);
 
-        const line_buffer = std.io.fixedBufferStream(try alloc.alloc(u8, 4096));
+        const line_buffer = std.io.fixedBufferStream(try alloc.alloc(u8, 8192));
 
         for (0..size) |b| {
             out_bufs[b] = std.io.fixedBufferStream(try alloc.alloc(u8, 4096));
@@ -104,6 +104,7 @@ pub const MultiProcessRunner = struct {
         // and just process what we get, also stop monitoring it with epoll
         var wait_for_newline = true;
         if (event.contains_event_hangup()) {
+            std.debug.print("fd {d} hung up, not waiting for new line\n", .{fd});
             self.closed_pipes[idx] += @intCast(out_type);
             try self.epoll_del(fd);
             wait_for_newline = false;
@@ -115,6 +116,7 @@ pub const MultiProcessRunner = struct {
         reading: while (true) {
             var tmp: [4096]u8 = undefined;
             const read_count = std.posix.read(fd, &tmp) catch 0;
+            std.debug.print("read {d} bytes from fd {d}\n", .{ read_count, fd });
             if (read_count == 0) {
                 break :reading;
             }
@@ -133,6 +135,15 @@ pub const MultiProcessRunner = struct {
 
                     buf.reset();
                 } else {
+                    const buf_is_full = (try buf.getPos() == try buf.getEndPos());
+                    if (buf_is_full) {
+                        line_writer.print("{s}:{s}~: {s}{s}\n", .{ label, out_name, buf.getWritten(), tmp[start..read_count] }) catch |err| {
+                            try stderr.print("Error formatting line '{s}'\n", .{@errorName(err)});
+                            return error.WriteError;
+                        };
+                        buf.reset();
+                        break :scanning;
+                    }
                     const write_count = buf.write(tmp[start..read_count]) catch |err| {
                         try stderr.print("Error writing to fd buffer '{s}'\n", .{@errorName(err)});
                         return error.WriteError;
@@ -156,6 +167,7 @@ pub const MultiProcessRunner = struct {
             }
         }
 
+        std.debug.print("buf.getPos() = {d} bytes\n", .{try buf.getPos()});
         if (!wait_for_newline and try buf.getPos() > 0) {
             defer self.line_buffer.reset();
             line_writer.print("{s}:{s}: {s}\n", .{ label, out_name, buf.getWritten() }) catch |err| {
@@ -182,7 +194,7 @@ pub const MultiProcessRunner = struct {
         idx: usize,
         out_name: []const u8,
         out_type: u8,
-        buf: std.io.FixedBufferStream([]u8),
+        buf: *std.io.FixedBufferStream([]u8),
         fd: std.posix.fd_t,
         events: u32,
 
@@ -199,11 +211,11 @@ pub const MultiProcessRunner = struct {
         if (event.data.u64 >= std.math.maxInt(u32)) {
             // stderr
             const idx = (event.data.u64 >> 32) - 1;
-            return .{ .idx = idx, .out_name = "err", .out_type = 1, .buf = self.err_buffers[idx], .fd = self.err_fds[idx], .events = event.events };
+            return .{ .idx = idx, .out_name = "err", .out_type = 1, .buf = &self.err_buffers[idx], .fd = self.err_fds[idx], .events = event.events };
         } else {
             // stdout
             const idx = event.data.u64 - 1;
-            return .{ .idx = idx, .out_name = "out", .out_type = 2, .buf = self.out_buffers[idx], .fd = self.out_fds[idx], .events = event.events };
+            return .{ .idx = idx, .out_name = "out", .out_type = 2, .buf = &self.out_buffers[idx], .fd = self.out_fds[idx], .events = event.events };
         }
     }
 
