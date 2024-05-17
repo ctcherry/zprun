@@ -8,5 +8,9 @@
         "LICENSE",
     },
     .dependencies = .{
+        .clap = .{
+            .url = "https://github.com/Hejsil/zig-clap/archive/master.tar.gz",
+            .hash = "12204b2fb733b2de9184d1907032709e79c2595b4adc9bed12a8383b114d4c0da932",
+        },
     },
 }

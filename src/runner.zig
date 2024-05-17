@@ -36,6 +36,8 @@ pub const MultiProcessRunner = struct {
     epoll_fd: i32,
     epoll_count: u8,
 
+    debug: bool = false,
+
     pub fn initCapacity(alloc: std.mem.Allocator, size: usize) !MultiProcessRunner {
         const out_pipe_fds = try alloc.alloc(std.posix.fd_t, size);
 
@@ -107,6 +109,13 @@ pub const MultiProcessRunner = struct {
         }
     }
 
+    fn debug_log(self: *MultiProcessRunner, comptime format: []const u8, params: anytype) void {
+        if (self.debug) {
+            std.debug.print(":debug: ", .{});
+            std.debug.print(format, params);
+        }
+    }
+
     fn process_event(self: *MultiProcessRunner, event: ParsedEvent) !void {
         const idx = event.idx;
         const out_name = event.out_name;
@@ -120,7 +129,7 @@ pub const MultiProcessRunner = struct {
         // and just process what we get, also stop monitoring it with epoll
         var wait_for_newline = true;
         if (event.contains_event_hangup()) {
-            std.debug.print("fd {d} hung up, not waiting for new line\n", .{fd});
+            self.debug_log("fd {d} hung up, not waiting for new line\n", .{fd});
             self.closed_pipes[idx] += @intCast(out_type);
             try self.epoll_del(fd);
             wait_for_newline = false;
@@ -132,7 +141,7 @@ pub const MultiProcessRunner = struct {
         reading: while (true) {
             var tmp: [BUFFER_SIZE]u8 = undefined;
             const read_count = std.posix.read(fd, &tmp) catch 0;
-            std.debug.print("read {d} bytes from fd {d}\n", .{ read_count, fd });
+            self.debug_log("read {d} bytes from fd {d}\n", .{ read_count, fd });
             if (read_count == 0) {
                 break :reading;
             }
@@ -183,7 +192,7 @@ pub const MultiProcessRunner = struct {
             }
         }
 
-        std.debug.print("buf.getPos() = {d} bytes\n", .{try buf.getPos()});
+        self.debug_log("buf.getPos() = {d} bytes\n", .{try buf.getPos()});
         if (!wait_for_newline and try buf.getPos() > 0) {
             defer self.line_buffer.reset();
             line_writer.print("{s}:{s}: {s}\n", .{ label, out_name, buf.getWritten() }) catch |err| {
@@ -293,9 +302,9 @@ pub const MultiProcessRunner = struct {
         var child = &self.children[idx];
         const stderr = std.io.getStdErr().writer();
         if (child.term) |term| {
-            std.debug.print("child '{s}' already terminated {any}\n", .{ label, term });
+            self.debug_log("child '{s}' already terminated {any}\n", .{ label, term });
         } else {
-            std.debug.print("wait terminating child '{s}'\n", .{label});
+            self.debug_log("wait terminating child '{s}'\n", .{label});
             const term = child.wait() catch |err| {
                 try stderr.print("Error waiting for child '{s}'\n", .{@errorName(err)});
                 return err;

@@ -1,13 +1,11 @@
 const std = @import("std");
 
 pub const Procfile = struct {
-    path: []const u8,
     file: std.fs.File,
 
     pub fn open(filePath: []const u8) !Procfile {
         const file = try std.fs.cwd().openFile(filePath, .{});
         return Procfile{
-            .path = filePath,
             .file = file,
         };
     }
@@ -16,7 +14,7 @@ pub const Procfile = struct {
         return self.file.close();
     }
 
-    pub fn cmdsForLabels(self: *Procfile, alloc: std.mem.Allocator, labels: [][]const u8) !std.ArrayList([]u8) {
+    pub fn cmdsForLabels(self: *Procfile, alloc: std.mem.Allocator, labels: []const []const u8) !std.ArrayList([]u8) {
         const buf = try alloc.alloc(u8, 1024);
         defer alloc.free(buf);
 

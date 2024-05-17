@@ -1,4 +1,5 @@
 const std = @import("std");
+const clap = @import("clap");
 const Procfile = @import("procfile.zig").Procfile;
 const MultiProcessRunner = @import("runner.zig").MultiProcessRunner;
 const MultiProcessRunnerMemoryNeeds = @import("runner.zig").totalMemoryNeeded;
@@ -6,63 +7,66 @@ const MultiProcessRunnerMemoryNeeds = @import("runner.zig").totalMemoryNeeded;
 const MAX_PARALLEL_PROCESSES = 32;
 const DEFAULT_PROCFILE_NAME = "Procfile";
 
-const Options = struct {
-    selfName: []const u8,
-    procfileName: []const u8,
-    targetLabels: std.ArrayList([]const u8),
-};
-
 pub fn main() !u8 {
     const stderr = std.io.getStdErr().writer();
 
     var allocSpace: [MultiProcessRunnerMemoryNeeds(MAX_PARALLEL_PROCESSES)]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&allocSpace);
-    var alloc = fba.allocator();
+    const alloc = fba.allocator();
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
 
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
 
-    var opts = Options{
-        .selfName = args[0],
-        .procfileName = try alloc.dupe(u8, DEFAULT_PROCFILE_NAME),
-        .targetLabels = std.ArrayList([]const u8).init(alloc),
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help             Display this help and exit.
+        \\-p, --procfile <str>   Filename (including optional path) of the Procfile to use. Default is 'Procfile'.
+        \\--debug                Debug messages
+        \\<str>...               Label(s) of one or more commands to run from the specified Procfile
+        \\
+    );
+
+    var diag = clap.Diagnostic{};
+    var res = clap.parse(clap.Help, &params, clap.parsers.default, .{
+        .diagnostic = &diag,
+        .allocator = gpa.allocator(),
+    }) catch |err| {
+        // Report useful error and exit
+        diag.report(std.io.getStdErr().writer(), err) catch {};
+        return err;
     };
 
-    var optsErrs = try OptionErrors.initCapacity(alloc, 2);
-    defer optsErrs.deinit();
-    getOptions(alloc, args, &opts, &optsErrs) catch {
-        for (optsErrs.items) |err| {
-            defer alloc.free(optsErrs.items[0]);
-            try stderr.print("{s}\n", .{err});
-        }
-        return 1;
-    };
+    defer res.deinit();
 
-    var procfile = Procfile.open(opts.procfileName) catch |err| {
+    const procfileName = res.args.procfile orelse DEFAULT_PROCFILE_NAME;
+
+    var procfile = Procfile.open(procfileName) catch |err| {
         switch (err) {
             error.FileNotFound => {
-                try stderr.print("Error: File '{s}' for procfile not found\n", .{opts.procfileName});
+                try stderr.print("Error: File '{s}' for procfile not found\n", .{procfileName});
             },
             else => {
-                try stderr.print("Error opening file '{s}' {s}\n", .{ opts.procfileName, @errorName(err) });
+                try stderr.print("Error opening file '{s}' {s}\n", .{ procfileName, @errorName(err) });
             },
         }
         return 1;
     };
     defer procfile.close();
 
-    if (opts.targetLabels.items.len == 0) {
-        try stderr.print("Usage: {s} [options] <label>\n\tlabel    Label of the command to run in Procfile\n\t-f path  Use file other than Procfile", .{opts.selfName});
-        return 1;
+    if (res.positionals.len == 0) {
+        try clap.help(std.io.getStdErr().writer(), clap.Help, &params, .{});
+        return 0;
     }
 
-    const commands = procfile.cmdsForLabels(alloc, opts.targetLabels.items) catch |err| {
+    const commands = procfile.cmdsForLabels(alloc, res.positionals) catch |err| {
         switch (err) {
             error.LabelNotFound => {
-                try stderr.print("Error: Unable to find all labels in procfile '{s}'\n", .{opts.procfileName});
+                try stderr.print("Error: Unable to find all labels in procfile '{s}'\n", .{procfileName});
             },
             error.EmptyCmd => {
-                try stderr.print("Error: Unable to find command for all labels in procfile '{s}'\n", .{opts.procfileName});
+                try stderr.print("Error: Unable to find command for all labels in procfile '{s}'\n", .{procfileName});
             },
             else => {
                 try stderr.print("Error: Extracting command from procfile '{s}'\n", .{@errorName(err)});
@@ -72,118 +76,15 @@ pub fn main() !u8 {
     };
 
     var runner = try MultiProcessRunner.initCapacity(alloc, commands.items.len);
+    if (res.args.debug > 0) {
+        runner.debug = true;
+    }
     for (0..commands.items.len) |i| {
-        try runner.addProcessAssumeCapacity(opts.targetLabels.items[i], commands.items[i]);
+        try runner.addProcessAssumeCapacity(res.positionals[i], commands.items[i]);
     }
     try runner.run();
 
     return 0;
-}
-
-const OptionErrors = std.ArrayList([]const u8);
-
-fn getOptions(alloc: std.mem.Allocator, args: anytype, opts: *Options, optsErrors: *OptionErrors) !void {
-    var argi: usize = 1;
-    while (argi < args.len) : (argi += 1) {
-        const arg = args[argi];
-        if (arg[0] == '-') {
-            if (std.mem.eql(u8, arg, "-f")) {
-                if (args.len - 1 >= argi + 1) {
-                    opts.procfileName = args[argi + 1];
-                    argi += 1;
-                    continue;
-                } else {
-                    const message = try std.fmt.allocPrint(
-                        alloc,
-                        "Missing argument for {s}",
-                        .{"-f"},
-                    );
-
-                    try optsErrors.append(message);
-                }
-            } else {
-                const message = try std.fmt.allocPrint(
-                    alloc,
-                    "Unknown argument '{s}'",
-                    .{arg},
-                );
-
-                try optsErrors.append(message);
-            }
-        } else {
-            opts.targetLabels.append(arg) catch |err| {
-                const message = try std.fmt.allocPrint(
-                    alloc,
-                    "Error adding target label '{s}', '{s}'",
-                    .{ arg, @errorName(err) },
-                );
-
-                try optsErrors.append(message);
-            };
-        }
-    }
-    if (optsErrors.items.len > 0) {
-        return error.OptionErrors;
-    }
-    return void{};
-}
-
-test "getOptions" {
-    const alloc = std.testing.allocator;
-
-    const base_opts = Options{
-        .selfName = "initial value",
-        .procfileName = "initial value",
-        .targetLabels = .{"initial value"},
-    };
-
-    const tests = .{
-        .{ "normal options", "cmd -f Procfiletest label0", "", "Procfiletest", "label0" },
-        .{ "reverse options", "cmd label0 -f Procfiletest", "", "Procfiletest", "label0" },
-        .{ "missing -f arg", "cmd label1 -f", "Missing argument for -f", "initial value", "label1" },
-        .{ "missing label", "cmd -f Procfiletest", "", "Procfiletest", "initial value" },
-        .{ "no params", "cmd", "Missing argument for -f", "initial value", "initial value" },
-        .{ "wrong param", "cmd -f Procfiletest -a", "Unknown argument '-a'", "Procfiletest", "initial value" },
-        .{ "wrong param 2", "cmd -a -f Procfiletest", "Unknown argument '-a'", "Procfiletest", "initial value" },
-        .{ "wrong param 3", "cmd -a", "Unknown argument '-a'", "initial value", "initial value" },
-    };
-
-    std.debug.print("\n", .{});
-    inline for (tests, 0..) |t, i| {
-        std.debug.print("Test {d} {s}: start...", .{ i, t[0] });
-        var opts = base_opts;
-        const cmdString = t[1];
-
-        var argBuffer = try std.ArrayList([]const u8).initCapacity(alloc, 5);
-
-        var argSeq = std.mem.splitSequence(u8, cmdString, " ");
-        var reading = true;
-        while (reading) {
-            const item = argSeq.next();
-            if (item) |ai| {
-                try argBuffer.append(ai);
-            } else {
-                reading = false;
-            }
-        }
-        const args = try argBuffer.toOwnedSlice();
-
-        const expected_procfilename: []const u8 = t[3];
-        const expected_label: []const u8 = t[4];
-
-        var optsErrs = try OptionErrors.initCapacity(alloc, 2);
-        defer optsErrs.deinit();
-        getOptions(alloc, args, &opts, &optsErrs) catch {
-            defer alloc.free(optsErrs.items[0]);
-            try std.testing.expectEqualStrings(t[2], optsErrs.items[0]);
-        };
-
-        // std.debug.print("XXXXXXX {any} '{s}' {any} '{s}'\n", .{ @TypeOf(expected_procfilename), expected_procfilename, @TypeOf(opts.procfileName), opts.procfileName });
-        try std.testing.expectEqualStrings(expected_procfilename, opts.procfileName);
-        try std.testing.expectEqualStrings(.{expected_label}, opts.targetLabels);
-        std.debug.print("done\n", .{});
-        alloc.free(args);
-    }
 }
 
 // test "getCmdFromProcfile errors" {
