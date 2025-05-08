@@ -131,7 +131,7 @@ fn execCmd(cmd: []u8) !void {
     const env = [_:null]?[*:0]u8{null};
 
     // Execute command, replacing this process!
-    return std.os.execvpeZ(argsPtrs.args[0].?, &argsPtrs.args, &env);
+    return std.posix.execvpeZ(argsPtrs.args[0].?, &argsPtrs.args, &env);
 }
 
 // caller is responsible for freeing returned []u8
