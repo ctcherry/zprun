@@ -405,13 +405,13 @@ test "cmdToArgPtrs table of tests" {
         var offset: usize = 0;
         var cmd: []u8 = buffer[offset..tlen];
         offset += tlen + 1;
-        std.mem.copy(u8, cmd, t[0]);
+        @memcpy(cmd, t[0]);
 
         var expResult: [t[1].len][]u8 = undefined;
         inline for (t[1], 0..) |word, i| {
             const w: []u8 = buffer[offset .. offset + word.len];
             offset += word.len + 1;
-            std.mem.copy(u8, w, word);
+            @memcpy(w, word);
             expResult[i] = w;
         }
         var resultRaw = cmdToArgPtrs(cmd[0..tlen]);
